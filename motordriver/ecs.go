@@ -2,7 +2,7 @@ package motordriver
 
 import (
 	channels "EtherCAT/channels"
-	logger "EtherCAT/logger"
+	logger   "EtherCAT/logger"
 	"EtherCAT/settings"
 	"time"
 )
@@ -134,11 +134,9 @@ func waitForECSZero(masterDevice MasterDevice) (int, error) {
 // Send finish signal via PDO (60FE:01 and 60FE:02).
 // Value 65536 = 1<<16, same bit written via SDO before.
 //
-// IMPORTANT: waits for apos to fully settle before asserting 60FE.
-// Asserting while the drive is still decelerating causes FF50
-// (overspeed following error). bit10 fires slightly before the
-// drive physically stops — 08:32 log shows +611k pulse overshoot
-// after bit10, then fault immediately on fin signal assertion.
+// Waits for apos to fully settle before asserting 60FE.
+// Uses getRawApos() so the settle check uses the sign-corrected value —
+// consistent with everything else in the position pipeline.
 // -------------------------------------------------------------------
 func sendECSFinSignal(device MasterDevice) error {
 	envSettings := settings.GetDriverSettings(device.Name)
@@ -152,12 +150,12 @@ func sendECSFinSignal(device MasterDevice) error {
 		settlePoll    = 20 * time.Millisecond
 		settleTimeout = 2 * time.Second
 	)
-	lastPos := pdoFbActual.Load()
+	lastPos := getRawApos()
 	stableCount := 0
 	settleStart := time.Now()
 	for time.Since(settleStart) < settleTimeout {
 		time.Sleep(settlePoll)
-		currentPos := pdoFbActual.Load()
+		currentPos := getRawApos()
 		if currentPos == lastPos {
 			stableCount++
 			if stableCount >= settleWindow {

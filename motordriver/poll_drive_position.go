@@ -1,12 +1,14 @@
 package motordriver
 
 /**
-Position polling now uses PDO feedback (pdoFbActual) updated by cyclic loop.
+Position polling uses PDO feedback updated by the cyclic loop.
+getRawApos() is used instead of pdoFbActual.Load() directly so that the
+boot-time encoder sign-flip correction is applied transparently here.
 **/
 
 import (
 	channels "EtherCAT/channels"
-	logger "EtherCAT/logger"
+	logger   "EtherCAT/logger"
 	"EtherCAT/motordriver/statusnotifier"
 	notifier "EtherCAT/motordriver/statusnotifier"
 	settings "EtherCAT/settings"
@@ -32,26 +34,26 @@ func stopDriverPolling() {
 }
 
 func pollDrivePositionProcess(device MasterDevice) {
-
 	logger.Info("polling status of driver:", device.Name)
-
-	
 
 	for {
 		select {
-
 		default:
 			driverSettings := settings.GetDriverSettings(device.Name)
+
 			// Wait until the cyclic loop has received at least one valid PDO frame
 			// (WC=COMPLETE) before reading position. Without this guard, the first
-			// broadcast to the UI uses pdoFbActual=0 or a stale value from before
-			// the EtherCAT domain became valid — showing wrong zero on first boot.
+			// broadcast to the UI uses a zero or stale value — showing wrong
+			// position on first boot.
 			if !pdoDomainValid.Load() {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 
-			rawPosition := pdoFbActual.Load()
+			// getRawApos() applies sign-flip correction transparently.
+			// HomingOffset, pitch error, work offsets are all applied downstream
+			// in currentPosition() and the withErrCorr calculation — unchanged.
+			rawPosition := getRawApos()
 
 			driveStatus := getCurrentDriverStatus(device.Name)
 
@@ -76,8 +78,6 @@ func pollDrivePositionProcess(device MasterDevice) {
 			// socket.io + JSON encode at 100Hz floods the Pi's CPU and SD card,
 			// causing HMI lag. Motor control is unaffected — it runs via PDO
 			// atomics at 2ms cycle, independent of this display loop.
-			// During active moves, 50ms gives smooth position feedback.
-			// At idle, the position is static so rate doesn't matter.
 			notifier.NotifyCurrentPosition(device.Name, withErrCorr)
 			currentDriverPosition(device, curPos)
 
@@ -96,7 +96,7 @@ func pollDrivePositionProcess(device MasterDevice) {
 				"dir:", dir,
 			)
 
-			time.Sleep(50* time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 
 		case <-stopChan:
 			logger.Debug("stopping driver position listener")
@@ -139,7 +139,6 @@ func checkPotNotLimit(
 			FastPowerOff(masterDevices[0])
 			StopJog(masterDevices[0])
 			logger.Trace("POT limit exceeded")
-
 			channels.WriteCommandExecInput("stop_prog_exec", "")
 			statusnotifier.Alarm("POT Limit Exceeded")
 			exceeded = true
@@ -154,7 +153,6 @@ func checkPotNotLimit(
 			FastPowerOff(masterDevices[0])
 			StopJog(masterDevices[0])
 			logger.Trace("NOT limit exceeded")
-
 			channels.WriteCommandExecInput("stop_prog_exec", "")
 			statusnotifier.Alarm("NOT Limit Exceeded")
 			notifyDriverStatus("pot_not_exceeded", "NOT", device)

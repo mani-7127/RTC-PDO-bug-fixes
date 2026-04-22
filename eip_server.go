@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -13,9 +14,10 @@ const (
 	cmdListServices    uint16 = 0x0004
 	cmdRegisterSession uint16 = 0x0065
 	cmdUnregister      uint16 = 0x0066
+	cmdSendRRData      uint16 = 0x006F
 )
 
-type encapHeader struct {
+type encapsulationHeader struct {
 	Command       uint16
 	Length        uint16
 	SessionHandle uint32
@@ -24,148 +26,184 @@ type encapHeader struct {
 	Options       uint32
 }
 
-var nextSession uint32 = 1001
+var nextSession uint32 = 1000
 
 func main() {
-	ln, err := net.Listen("tcp", ":44818")
+	listener, err := net.Listen("tcp", ":44818")
 	if err != nil {
 		log.Fatalf("listen failed: %v", err)
 	}
-	defer ln.Close()
+	defer listener.Close()
 
-	log.Println("EtherNet/IP POC server listening on TCP 44818")
+	log.Println("EtherNet/IP 2-way POC server listening on TCP 44818")
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("accept error: %v", err)
 			continue
 		}
-		go handleConn(conn)
+		go handleConnection(conn)
 	}
 }
 
-func handleConn(conn net.Conn) {
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	log.Printf("client connected: %s", conn.RemoteAddr())
 
 	for {
-		var hdr encapHeader
-		if err := binary.Read(conn, binary.LittleEndian, &hdr); err != nil {
+		var header encapsulationHeader
+		if err := binary.Read(conn, binary.LittleEndian, &header); err != nil {
 			if err != io.EOF {
 				log.Printf("read header error: %v", err)
 			}
+			log.Printf("client disconnected: %s", conn.RemoteAddr())
 			return
 		}
 
-		payload := make([]byte, hdr.Length)
+		payload := make([]byte, header.Length)
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			log.Printf("read payload error: %v", err)
 			return
 		}
 
-		switch hdr.Command {
+		switch header.Command {
 		case cmdRegisterSession:
-			if len(payload) < 4 {
-				writeError(conn, hdr, 0x0001)
-				continue
-			}
+			handleRegisterSession(conn, header, payload)
 
-			protoVer := binary.LittleEndian.Uint16(payload[0:2])
-			if protoVer != 1 {
-				writeError(conn, hdr, 0x0069)
-				continue
-			}
-
-			session := atomic.AddUint32(&nextSession, 1)
-
-			respPayload := make([]byte, 4)
-			binary.LittleEndian.PutUint16(respPayload[0:2], 1) // protocol version
-			binary.LittleEndian.PutUint16(respPayload[2:4], 0) // options flags
-
-			resp := encapHeader{
-				Command:       cmdRegisterSession,
-				Length:        uint16(len(respPayload)),
-				SessionHandle: session,
-				Status:        0,
-				SenderContext: hdr.SenderContext,
-				Options:       0,
-			}
-			if err := writePacket(conn, resp, respPayload); err != nil {
-				log.Printf("write register response error: %v", err)
-				return
-			}
-			log.Printf("registered session %d for %s", session, conn.RemoteAddr())
+		case cmdSendRRData:
+			handleSendRRData(conn, header, payload)
 
 		case cmdUnregister:
-			log.Printf("unregistered session %d from %s", hdr.SessionHandle, conn.RemoteAddr())
+			log.Printf("unregistered session %d from %s", header.SessionHandle, conn.RemoteAddr())
 			return
 
 		case cmdListServices:
-			// Minimal placeholder response for POC
-			respPayload := minimalListServicesPayload()
-
-			resp := encapHeader{
+			responsePayload := minimalListServicesPayload()
+			responseHeader := encapsulationHeader{
 				Command:       cmdListServices,
-				Length:        uint16(len(respPayload)),
-				SessionHandle: hdr.SessionHandle,
+				Length:        uint16(len(responsePayload)),
+				SessionHandle: header.SessionHandle,
 				Status:        0,
-				SenderContext: hdr.SenderContext,
+				SenderContext: header.SenderContext,
 				Options:       0,
 			}
-			if err := writePacket(conn, resp, respPayload); err != nil {
-				log.Printf("write list services response error: %v", err)
+			if err := writePacket(conn, responseHeader, responsePayload); err != nil {
+				log.Printf("write ListServices response error: %v", err)
 				return
 			}
 
 		default:
-			log.Printf("unsupported command 0x%04X from %s", hdr.Command, conn.RemoteAddr())
-			writeError(conn, hdr, 0x0008)
+			log.Printf("unsupported command 0x%04X from %s", header.Command, conn.RemoteAddr())
+			writeError(conn, header, 0x0008)
 		}
 	}
 }
 
-func writeError(conn net.Conn, req encapHeader, status uint32) {
-	resp := encapHeader{
-		Command:       req.Command,
-		Length:        0,
-		SessionHandle: req.SessionHandle,
-		Status:        status,
-		SenderContext: req.SenderContext,
+func handleRegisterSession(conn net.Conn, header encapsulationHeader, payload []byte) {
+	if len(payload) < 4 {
+		writeError(conn, header, 0x0001)
+		return
+	}
+
+	protocolVersion := binary.LittleEndian.Uint16(payload[0:2])
+	if protocolVersion != 1 {
+		writeError(conn, header, 0x0069)
+		return
+	}
+
+	session := atomic.AddUint32(&nextSession, 1)
+
+	responsePayload := make([]byte, 4)
+	binary.LittleEndian.PutUint16(responsePayload[0:2], 1)
+	binary.LittleEndian.PutUint16(responsePayload[2:4], 0)
+
+	responseHeader := encapsulationHeader{
+		Command:       cmdRegisterSession,
+		Length:        uint16(len(responsePayload)),
+		SessionHandle: session,
+		Status:        0,
+		SenderContext: header.SenderContext,
 		Options:       0,
 	}
-	_ = writePacket(conn, resp, nil)
+
+	if err := writePacket(conn, responseHeader, responsePayload); err != nil {
+		log.Printf("write RegisterSession response error: %v", err)
+		return
+	}
+
+	log.Printf("registered session %d for %s", session, conn.RemoteAddr())
 }
 
-func writePacket(conn net.Conn, hdr encapHeader, payload []byte) error {
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.LittleEndian, hdr); err != nil {
+func handleSendRRData(conn net.Conn, header encapsulationHeader, payload []byte) {
+	receivedMessage := string(payload)
+
+	log.Printf("Received SendRRData from session %d", header.SessionHandle)
+	log.Printf("Payload length: %d bytes", len(payload))
+	log.Printf("Raw bytes: % X", payload)
+	log.Printf("As string: %s", receivedMessage)
+
+	replyMessage := fmt.Sprintf("I received your message: %s", receivedMessage)
+	replyPayload := []byte(replyMessage)
+
+	responseHeader := encapsulationHeader{
+		Command:       cmdSendRRData,
+		Length:        uint16(len(replyPayload)),
+		SessionHandle: header.SessionHandle,
+		Status:        0,
+		SenderContext: header.SenderContext,
+		Options:       0,
+	}
+
+	if err := writePacket(conn, responseHeader, replyPayload); err != nil {
+		log.Printf("write SendRRData response error: %v", err)
+		return
+	}
+
+	log.Printf("Reply sent: %s", replyMessage)
+}
+
+func writeError(conn net.Conn, requestHeader encapsulationHeader, status uint32) {
+	responseHeader := encapsulationHeader{
+		Command:       requestHeader.Command,
+		Length:        0,
+		SessionHandle: requestHeader.SessionHandle,
+		Status:        status,
+		SenderContext: requestHeader.SenderContext,
+		Options:       0,
+	}
+	_ = writePacket(conn, responseHeader, nil)
+}
+
+func writePacket(conn net.Conn, header encapsulationHeader, payload []byte) error {
+	buffer := new(bytes.Buffer)
+
+	if err := binary.Write(buffer, binary.LittleEndian, header); err != nil {
 		return err
 	}
+
 	if len(payload) > 0 {
-		if _, err := buf.Write(payload); err != nil {
+		if _, err := buffer.Write(payload); err != nil {
 			return err
 		}
 	}
-	_, err := conn.Write(buf.Bytes())
+
+	_, err := conn.Write(buffer.Bytes())
 	return err
 }
 
 func minimalListServicesPayload() []byte {
-	// Very small POC payload: item count 1, one item entry
-	// Not intended as a production-compliant stack.
-	buf := new(bytes.Buffer)
+	buffer := new(bytes.Buffer)
 
-	_ = binary.Write(buf, binary.LittleEndian, uint16(1))      // item count
-	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0100)) // type id: list services
-	_ = binary.Write(buf, binary.LittleEndian, uint16(20))     // item length
-
-	_ = binary.Write(buf, binary.LittleEndian, uint16(1)) // version
-	_ = binary.Write(buf, binary.LittleEndian, uint16(0)) // capability flags
+	_ = binary.Write(buffer, binary.LittleEndian, uint16(1))
+	_ = binary.Write(buffer, binary.LittleEndian, uint16(0x0100))
+	_ = binary.Write(buffer, binary.LittleEndian, uint16(20))
+	_ = binary.Write(buffer, binary.LittleEndian, uint16(1))
+	_ = binary.Write(buffer, binary.LittleEndian, uint16(0))
 
 	name := make([]byte, 16)
 	copy(name, []byte("EtherNet/IP POC"))
-	_, _ = buf.Write(name)
+	_, _ = buffer.Write(name)
 
-	return buf.Bytes()
+	return buffer.Bytes()
 }

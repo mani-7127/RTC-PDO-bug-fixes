@@ -6,8 +6,8 @@ import (
 	"EtherCAT/logger"
 	"EtherCAT/motordriver/statusnotifier"
 	settings "EtherCAT/settings"
-	"time"
 	"fmt"
+	"time"
 )
 
 var driverConnectionStatus = "SUCCESS"
@@ -61,22 +61,23 @@ func InitMaster() error {
 		masterDevices = append(masterDevices, masterDevice)
 
 		// Wait for domain to be valid (WC complete) AND no fault before SDO config.
-// pdoDomainValid is set only after first valid PDO frame — guarantees PREOP+ 
-// and that stw is real, not zero/stale.
-for i := 0; i < 50; i++ {
-	if pdoDomainValid.Load() {
-			break
-	}
-	logger.Info("Waiting for PDO domain valid before configuring driver:", dev.Name)
-	time.Sleep(100 * time.Millisecond)
-}
-for i := 0; i < 30; i++ {
-	if (pdoFbStatus.Load() & 0x0008) == 0 {
-			break
-	}
-	logger.Info("Waiting for drive fault to clear before configuring driver:", dev.Name)
-	time.Sleep(100 * time.Millisecond)
-}
+		// pdoDomainValid is set only after first valid PDO frame — guarantees PREOP+
+		// and that stw is real, not zero/stale.
+		for i := 0; i < 50; i++ {
+			if pdoDomainValid.Load() {
+				break
+			}
+			logger.Info("Waiting for PDO domain valid before configuring driver:", dev.Name)
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		for i := 0; i < 30; i++ {
+			if (pdoFbStatus.Load() & 0x0008) == 0 {
+				break
+			}
+			logger.Info("Waiting for drive fault to clear before configuring driver:", dev.Name)
+			time.Sleep(100 * time.Millisecond)
+		}
 
 		configErr := configureDriver(masterDevice)
 		if configErr != nil {
@@ -109,9 +110,8 @@ for i := 0; i < 30; i++ {
 			time.Sleep(300 * time.Millisecond)
 		}
 
-		// InitAposCorrection computes a boot-time offset that absorbs any
-		// encoder sign flip transparently inside currentPosition().
-		// HomingOffset (user-configured) is never modified by this.
+		// Keep existing boot flow intact.
+		// This now applies correction only for a genuine full power-cycle sign flip.
 		InitAposCorrection(dev.Name)
 
 		position++
@@ -153,27 +153,27 @@ func initListeners(masterDevices []MasterDevice) {
 func ShutdownMasters() {
 	logger.Info("ShutdownMasters: sending cwShutdown to drive")
 	for _, device := range masterDevices {
-			FastPowerOff(device)
+		FastPowerOff(device)
 	}
 	// Wait for drive to leave Operation Enabled state
 	for i := 0; i < 500; i++ {
-			stw := uint16(pdoFbStatus.Load())
-			state := stw & 0x006F
-			if (stw&0x0008) == 0 && state != 0x0027 && state != 0x0023 {
-					logger.Info("ShutdownMasters: drive safe stw=0x",
-							fmt.Sprintf("%04X", stw), "after", i*2, "ms")
-					break
-			}
-			if i == 499 {
-					logger.Warn("ShutdownMasters: timeout stw=0x", fmt.Sprintf("%04X", stw))
-			}
-			time.Sleep(2 * time.Millisecond)
+		stw := uint16(pdoFbStatus.Load())
+		state := stw & 0x006F
+		if (stw&0x0008) == 0 && state != 0x0027 && state != 0x0023 {
+			logger.Info("ShutdownMasters: drive safe stw=0x",
+				fmt.Sprintf("%04X", stw), "after", i*2, "ms")
+			break
+		}
+		if i == 499 {
+			logger.Warn("ShutdownMasters: timeout stw=0x", fmt.Sprintf("%04X", stw))
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	stopPdoCyclic()
-        time.Sleep(50 * time.Millisecond)
-        for _, device := range masterDevices {
-                ReleaseMaster(device.Master)
-        }
+	time.Sleep(50 * time.Millisecond)
+	for _, device := range masterDevices {
+		ReleaseMaster(device.Master)
+	}
 }
 
 func PowerOnMasters() {

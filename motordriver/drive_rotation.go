@@ -69,7 +69,8 @@ func ManualJog(masterDevice MasterDevice, direction int) error {
 		cmd = math.MinInt32
 	}
 	pdoCmdVelocity.Store(int32(cmd))
-	pdoCmdTarget.Store(pdoFbActual.Load())
+	// Seed target to current corrected position so PP hold after jog stops is correct.
+	pdoCmdTarget.Store(getRawApos())
 	logger.Info("ManualJog PV started. rpm=", rpm, " 60FF=", int32(cmd))
 	return nil
 }
@@ -83,11 +84,13 @@ func StopJog(masterDevice MasterDevice) error {
 		pdoEnableRequested.Store(false)
 		go func() {
 			time.Sleep(120 * time.Millisecond)
-			pdoCmdTarget.Store(pdoFbActual.Load())
+			// Re-enable holding at corrected current position.
+			pdoCmdTarget.Store(getRawApos())
 			pdoEnableRequested.Store(true)
 		}()
 	} else {
-		pdoCmdTarget.Store(pdoFbActual.Load())
+		// Already in PP — hold at corrected current position.
+		pdoCmdTarget.Store(getRawApos())
 	}
 	notifyDriverStatus("motor_running", "false", masterDevice)
 	envSettings := settings.GetDriverSettings(masterDevice.Name)
@@ -140,7 +143,11 @@ func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
 		return clampErr
 	}
 
-	currentActual := pdoFbActual.Load()
+	// Use getRawApos() so the move target is computed from the sign-corrected
+	// position. If a sign flip occurred at boot and we used pdoFbActual.Load()
+	// directly here, the target pulse would be wrong by ~2× the position value,
+	// sending the motor to a completely incorrect angle.
+	currentActual := getRawApos()
 	delta := deltaPulses64
 	if delta > math.MaxInt32 {
 		delta = math.MaxInt32
@@ -200,7 +207,7 @@ func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
 		time.Sleep(poll)
 	}
 
-	// Phase 2b: then wait for the next real target-reached edge.
+	// Phase 2b: wait for the next real target-reached edge.
 	start := time.Now()
 	for time.Since(start) < timeout {
 		if pdoStopRequest.Load() {
@@ -216,6 +223,20 @@ func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
 	}
 
 	logger.Info("Target reached (bit10) for driver:", masterDevice.Name)
+
+	// Resync tpos = actual settled apos.
+	// After a move, bit10 fires when the drive declares the target reached,
+	// but apos may have settled 1-2 pulses away from the commanded tpos due
+	// to deceleration overshoot or encoder quantisation. If we leave tpos
+	// pointing at the old commanded value, the next move computes:
+	//   newTarget = getRawApos() + delta
+	// which is correct, but the drive's internal reference (tpos) disagrees
+	// by those residual pulses. Over many moves this accumulates as drift —
+	// visible as the motor making a small extra rotation at the start of each
+	// new move to "close" the tpos gap before executing the real move.
+	// Resyncing tpos to the actual apos here eliminates that drift entirely.
+	pdoCmdTarget.Store(getRawApos())
+
 	notifyDriverStatus("motor_running", "false", masterDevice)
 	_, clampErr := hasClamped(masterDevice, envSettings)
 	if clampErr != nil {
