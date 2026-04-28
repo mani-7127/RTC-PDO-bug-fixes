@@ -44,14 +44,30 @@ func moveToZero(device MasterDevice) error {
 
 	freeRotate(device, position)
 
-	// Wait for physical standstill, then save the RAW encoder value.
-	// pdoFbActual.Load() is used directly here — NOT getRawApos() — because
-	// InitAposCorrection reads pdoFbActual.Load() for bootApos and compares
-	// it against HomingApos. Both must use the same raw sign space.
-	aposAtZero := waitForMotorSettle(10*time.Second, 50*time.Millisecond, 3)
+	// Wait for physical standstill.
+	// Save HomingApos as a NORMALIZED negative value regardless of
+	// what signFlipActive is at this moment.
+	//
+	// WHY: if zero-ref is done on a flipped boot, pdoFbActual is positive
+	// (+520984704). On the next normal boot pdoFbActual is negative
+	// (-520984704). InitAposCorrection sees opposite signs and wrongly
+	// applies correction — display shows 3.174° instead of 0.000°.
+	//
+	// By always saving HomingApos as negative (abs value negated), both
+	// sides of the InitAposCorrection comparison are always in the same
+	// space: bootApos negative (no flip) matches, bootApos positive (flip)
+	// gets corrected to negative — either way currentPosition() sees the
+	// same value every single boot.
+	rawAtZero := waitForMotorSettle(10*time.Second, 50*time.Millisecond, 3)
+	var aposAtZero int32
+	if rawAtZero > 0 {
+		aposAtZero = -rawAtZero // normalize to negative
+	} else {
+		aposAtZero = rawAtZero
+	}
 
 	logger.Info("HomingApos captured after motor settled:",
-		aposAtZero, "for driver:", device.Device.Name)
+		aposAtZero, "(normalized negative) for driver:", device.Device.Name)
 
 	if err := settings.SaveHomingReference(device.Device.Name, aposAtZero); err != nil {
 		logger.Error("Failed to save HomingApos after zero ref:", err)

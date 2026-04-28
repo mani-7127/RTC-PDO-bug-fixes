@@ -1,27 +1,28 @@
 package clientcommunication
 
 import (
-	channels "EtherCAT/channels"
+	channels  "EtherCAT/channels"
 	executors "EtherCAT/executors"
 	"EtherCAT/helper"
-	logger "EtherCAT/logger"
+	logger    "EtherCAT/logger"
 	"EtherCAT/systemupdate"
-	settings "EtherCAT/settings"
-	ren "EtherCAT/ren" // ⭐ NEW IMPORT
+	settings  "EtherCAT/settings"
+	ren       "EtherCAT/ren"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	gosocketio "github.com/graarh/golang-socketio"
 	"github.com/graarh/golang-socketio/transport"
 )
 
-//ConnectedClientList keep tracks of all the clients connected
+// ConnectedClientList keep tracks of all the clients connected
 type ConnectedClientList struct {
 	Clients []Client
 }
 
-//Client keeps client details connected via socket
+// Client keeps client details connected via socket
 type Client struct {
 	Channel *gosocketio.Channel
 	ID      string
@@ -33,19 +34,24 @@ func init() {
 	channels.BroadCastUIChannel = make(chan channels.SocketMessage, 100)
 }
 
-var rs232State int = 0 // 0 = OFF, 1 = ON(Socketserver rs232 state change)
+var rs232State int = 0
 
-// RS232 status payload contract for UI: { Data: "0" } or { Data: "1" }
 type rs232Status struct {
 	Data string `json:"Data"`
 }
 
-//Start for socket connection from client
+// executionInProgress prevents two browser sessions from executing programs
+// simultaneously. Without this lock, two tabs pressing Execute simultaneously
+// race on execContext, send concurrent moves, and fire clamp/declamp at the
+// same time — which can send the motor to wrong positions or engage the brake
+// while the motor is still moving.
+var executionInProgress atomic.Bool
+
+// Start for socket connection from client
 func Start() error {
 
 	server := gosocketio.NewServer(transport.GetDefaultWebsocketTransport())
 
-	// ---- RS232: restore persisted state on backend boot ----
 	data, err := settings.LoadRS232Data()
 	if err != nil {
 		logger.Error("Failed to load RS232 status from disk:", err)
@@ -63,7 +69,6 @@ func Start() error {
 	socketEventsCreator(server)
 	serveMux := http.NewServeMux()
 	serveMux.Handle("/socket.io/", server)
-	//go routine waiting for any sort of messages that needs to transmit to ui
 	go uiBradcastMessageListner()
 
 	logger.Info("starting socket.io server listening at port 9090...")
@@ -82,7 +87,6 @@ func socketEventsCreator(server *gosocketio.Server) {
 		connectedClients.Clients = append(connectedClients.Clients, client)
 		channels.SendAlarm("No Alarms")
 
-		// ---- RS232: push current status to UI on connect ----
 		cur := "0"
 		if executors.RS232Enabled.Load() {
 			cur = "1"
@@ -164,8 +168,24 @@ func socketEventsCreator(server *gosocketio.Server) {
 
 	server.On("stop_execution", func(c *gosocketio.Channel, msg channels.SocketMessage) {
 		logger.Debug("stop executing program")
+		// BUG FIX: Do NOT send move_next_line alongside stop_prog_exec.
+		//
+		// The old code sent both simultaneously:
+		//   channels.WriteCommandExecInput("stop_prog_exec", "")
+		//   channels.WriteCommandExecInput("move_next_line", "1")
+		//
+		// move_next_line unblocks the ECS wait channel (WaitExecuteNextCommand),
+		// which caused the program to advance to the next line at the same
+		// instant it was being stopped. In the log this appeared as:
+		//   "stop_prog_exec received"
+		//   "move to next line commanded from ui"   ← both at same timestamp
+		// The result: the stopped line counter was wrong, resume line was
+		// off by one, and on the next execute it started from the wrong position.
+		//
+		// stop_prog_exec alone is sufficient — the execution loop checks
+		// StopExecution on every iteration and exits cleanly without needing
+		// an explicit channel unblock.
 		channels.WriteCommandExecInput("stop_prog_exec", "")
-		channels.WriteCommandExecInput("move_next_line", "1")
 	})
 
 	server.On("resetMultiTurn", func(c *gosocketio.Channel, msg channels.SocketMessage) {
@@ -201,7 +221,6 @@ func socketEventsCreator(server *gosocketio.Server) {
 		}
 	})
 
-	// ⭐ UPDATED — Save PC Configuration + Update Renishaw Runtime Config
 	server.On("save-text-program", func(c *gosocketio.Channel, config settings.TextProgramConfig) {
 		logger.Info("save-text-program event received from client")
 
@@ -210,8 +229,6 @@ func socketEventsCreator(server *gosocketio.Server) {
 			logger.Error("failed to save text program config:", err)
 		} else {
 			logger.Info("text program config saved successfully to textprogram.json")
-
-			// ⭐ NEW — Update Renishaw logic with new credentials & paths
 			ren.UpdateTextProgramConfig(config)
 		}
 	})
@@ -229,7 +246,6 @@ func socketEventsCreator(server *gosocketio.Server) {
 		c.Emit("text-program-config", config)
 	})
 
-	// ---- RS232: UI asks for current status ----
 	server.On("get_rs232_status", func(c *gosocketio.Channel) {
 		cur := "0"
 		if executors.RS232Enabled.Load() {
@@ -239,8 +255,6 @@ func socketEventsCreator(server *gosocketio.Server) {
 	})
 
 	server.On("rs232_toggle", func(c *gosocketio.Channel, msg channels.SocketMessage) {
-
-		// sanitize: accept only "0" or "1"
 		data := msg.Data
 		if data != "0" && data != "1" {
 			data = "0"
@@ -256,19 +270,28 @@ func socketEventsCreator(server *gosocketio.Server) {
 			logger.Info("RS232 state updated to: 0 (DISABLED)")
 		}
 
-		// Persist to disk so reboot remembers
 		if err := settings.SaveRS232Data(data); err != nil {
 			logger.Error("Failed to save RS232 status to disk:", err)
 		}
 
-		// Broadcast updated status to all connected clients
 		for _, cl := range connectedClients.Clients {
 			cl.Channel.Emit("rs232_status", rs232Status{Data: data})
 		}
 	})
 }
 
+// executeProgram runs the named program file.
+// The execution lock ensures only one program runs at a time across all
+// connected browser sessions. A second Execute from any tab while a program
+// is running is rejected with a clear alarm — no silent race conditions.
 func executeProgram(fileName string) {
+	if !executionInProgress.CompareAndSwap(false, true) {
+		logger.Warn("Execution already in progress — ignoring duplicate execute request from:", fileName)
+		channels.SendAlarm("Program already running. Stop current execution first.")
+		return
+	}
+	defer executionInProgress.Store(false)
+
 	err := executors.RunCodeFile(helper.GetCodeFilePath() + "/" + fileName)
 	if err != nil {
 		logger.Error(err)
@@ -314,48 +337,3 @@ func sendAlarm(message channels.SocketMessage) {
 		client.Channel.Emit(message.Event, message.Alarm)
 	}
 }
-
-/*
-	custom events listen by ui client
-	--------------------------------------
-	reset_alert
-	pos_data: destination postion
-	sent_file_cont: sent the file content of program
-	reset_done
-	destination_position  (tcpserver.js line# 415 ui_clients[i].emit("destination_position",{"pos":p+(mp.factor_backlash*mp.drive_backlash)-pe_val});)
-	alarm_error
-	FINSIGNAL
-	alarms
-	ref_complete  (updateClients("ref_complete",{'ref':'complete'});)
-	ETH_DOWN  updateClients('ETH_DOWN', "Ethercat communication down...");
-	ETH_UP  updateClients('ETH_UP', "Ethercat communication up...");
-
-	custom events listen by server
-	--------------------------------------
-	set_program_mode
-	program
-	status
-	stop_execution
-	updateSettings
-	reset
-	resetMultiTurn
-	emergency
-	execute
-	get_file_cont
-	line_number
-	line_complete
-	enable_step_mode
-	step_mode
-	jog_mode
-	start_homing
-	stop_homing
-	homing_complete
-	pos_data
-	destination_position
-	exec_next_line
-	enable_ecs
-	disable_ecs
-	goToZero
-	pot_hard_limit
-	not_hard_limit
-*/

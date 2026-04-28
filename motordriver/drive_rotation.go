@@ -7,6 +7,7 @@ import (
 	settings "EtherCAT/settings"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"math"
 	"time"
 )
@@ -61,6 +62,8 @@ func ManualJog(masterDevice MasterDevice, direction int) error {
 	pdoJogStep.Store(0)
 	pdoCmdMode.Store(cia402ModeProfileVelocity)
 	pdoEnableRequested.Store(true)
+	// Invalidate any pending StopJog re-enable goroutine from a previous jog.
+	jogStopSeq.Add(1)
 	cmd := int64(rpm)
 	if cmd > math.MaxInt32 {
 		cmd = math.MaxInt32
@@ -70,10 +73,16 @@ func ManualJog(masterDevice MasterDevice, direction int) error {
 	}
 	pdoCmdVelocity.Store(int32(cmd))
 	// Seed target to current corrected position so PP hold after jog stops is correct.
-	pdoCmdTarget.Store(getRawApos())
+	pdoCmdTarget.Store(correctedToCmdTarget(getRawApos()))
 	logger.Info("ManualJog PV started. rpm=", rpm, " 60FF=", int32(cmd))
 	return nil
 }
+
+// jogStopSeq is incremented each time StopJog is called.
+// The re-enable goroutine checks it before writing — if it changed,
+// another operation (zero-ref, program move) already took over and
+// the goroutine must not overwrite the new target.
+var jogStopSeq atomic.Int64
 
 func StopJog(masterDevice MasterDevice) error {
 	logger.Trace("stop jog (PDO velocity fast-stop), driver:", masterDevice.Name)
@@ -82,15 +91,29 @@ func StopJog(masterDevice MasterDevice) error {
 	pdoCmdVelocity.Store(0)
 	if int8(pdoFbMode.Load()) == cia402ModeProfileVelocity {
 		pdoEnableRequested.Store(false)
+
+		// BUG FIX: The re-enable goroutine previously fired unconditionally
+		// after 120ms and overwrote pdoCmdTarget with getRawApos(). If zero-ref
+		// or a program move started within that 120ms window, the goroutine
+		// silently corrupted the new move target mid-flight, causing the motor
+		// to chase a moving target and appear to rotate endlessly.
+		//
+		// Fix: capture the sequence number before sleeping. If it changed by
+		// the time we wake up, another operation owns the drive — abort.
+		seq := jogStopSeq.Add(1)
 		go func() {
 			time.Sleep(120 * time.Millisecond)
-			// Re-enable holding at corrected current position.
-			pdoCmdTarget.Store(getRawApos())
+			if jogStopSeq.Load() != seq {
+				// Another operation started — do not overwrite its target.
+				logger.Debug("StopJog re-enable goroutine cancelled — drive already claimed")
+				return
+			}
+			pdoCmdTarget.Store(correctedToCmdTarget(getRawApos()))
 			pdoEnableRequested.Store(true)
 		}()
 	} else {
 		// Already in PP — hold at corrected current position.
-		pdoCmdTarget.Store(getRawApos())
+		pdoCmdTarget.Store(correctedToCmdTarget(getRawApos()))
 	}
 	notifyDriverStatus("motor_running", "false", masterDevice)
 	envSettings := settings.GetDriverSettings(masterDevice.Name)
@@ -126,6 +149,23 @@ func freeRotate(masterDevice MasterDevice, valueinDegree float64) error {
 }
 
 func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
+	// BUG FIX: Guard against AL state != OP before issuing any move.
+	// When al_states=4 (SAFEOP), PDO outputs are zeroed by the EtherCAT master
+	// — the drive never sees the target position or mode switch. Any residual
+	// velocity from a previous jog (60FF != 0) keeps the motor spinning
+	// indefinitely because the stop command never arrives.
+	// This was the cause of "kept rotating without stopping after zero-ref"
+	// when the system was run while al_states=4 was flooding the log.
+	alState := pdoAlState.Load()
+	if alState != 0x08 { // 0x08 = EC_AL_STATE_OP
+		return fmt.Errorf("doRotate rejected: EtherCAT not in OP state (al_states=0x%02X) — wait for AL=OP before moving", alState)
+	}
+
+	// Invalidate any pending StopJog re-enable goroutine.
+	// If a jog was stopped < 120ms ago, its goroutine would overwrite our
+	// target mid-move. Incrementing jogStopSeq causes the goroutine to abort.
+	jogStopSeq.Add(1)
+
 	FastPowerOn(masterDevice)
 	envSettings := settings.GetDriverSettings(masterDevice.Name)
 	_, declampErr := hasDeclamped(masterDevice, envSettings)
@@ -143,10 +183,13 @@ func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
 		return clampErr
 	}
 
-	// Use getRawApos() so the move target is computed from the sign-corrected
-	// position. If a sign flip occurred at boot and we used pdoFbActual.Load()
-	// directly here, the target pulse would be wrong by ~2× the position value,
-	// sending the motor to a completely incorrect angle.
+	// Compute move target in the sign-corrected coordinate space so delta
+	// calculations are consistent with currentPosition() and display.
+	// Then convert back to drive raw space before writing pdoCmdTarget,
+	// because the drive hardware operates in its own uncorrected space.
+	// Without this conversion, when signFlipActive=true the stored target
+	// has the wrong sign — the drive sees a target ~2× the distance away
+	// and spins for hundreds of rotations trying to reach it.
 	currentActual := getRawApos()
 	delta := deltaPulses64
 	if delta > math.MaxInt32 {
@@ -161,7 +204,7 @@ func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
 	pdoJogActive.Store(false)
 	pdoJogStep.Store(0)
 	pdoCmdMode.Store(cia402ModeProfilePosition)
-	pdoCmdTarget.Store(target)
+	pdoCmdTarget.Store(correctedToCmdTarget(target))
 	pdoEnableRequested.Store(true)
 
 	const (
@@ -235,7 +278,7 @@ func doRotate(masterDevice MasterDevice, valueinDegree float64) error {
 	// visible as the motor making a small extra rotation at the start of each
 	// new move to "close" the tpos gap before executing the real move.
 	// Resyncing tpos to the actual apos here eliminates that drift entirely.
-	pdoCmdTarget.Store(getRawApos())
+	pdoCmdTarget.Store(correctedToCmdTarget(getRawApos()))
 
 	notifyDriverStatus("motor_running", "false", masterDevice)
 	_, clampErr := hasClamped(masterDevice, envSettings)

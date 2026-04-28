@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"strconv"
+	"sync"
 )
 
 type DriverSettings struct {
@@ -16,8 +17,7 @@ type DriverSettings struct {
 	HomingOffset       float32         `json:"homing_offset,string"`
 	// HomingApos is the raw encoder apos saved at zero-ref time.
 	// Written only by zero_reference.go — never by boot logic.
-	// Used at boot to compute an in-memory aposCorrection so that
-	// currentPosition() gives the correct display after an encoder sign flip.
+	// Used at boot to detect encoder sign flips transparently.
 	// HomingOffset (user-configured) is NEVER modified by the system.
 	HomingApos         int32           `json:"homing_apos,string"`
 	HomeDirection      int             `json:"home_dir"`
@@ -99,22 +99,35 @@ type SettingsRoot map[string]DriverSettings
 
 var settingsRoot SettingsRoot
 
+// settingsMu protects settingsRoot from concurrent read/write panics.
+//
+// settingsRoot is accessed from multiple goroutines simultaneously:
+//   - poll_drive_position reads GetDriverSettings every 50ms
+//   - move_to_degree reads on every move
+//   - ecs.go reads on every ECS check
+//   - zero_reference writes SaveHomingReference after zero-ref
+//   - REST API writes on settings save
+//
+// Without a mutex, concurrent map access causes a runtime panic:
+//   "concurrent map read and map write"
+//
+// RWMutex: multiple readers never block each other, only writes are exclusive.
+// This keeps the 50ms poll loop fast under normal operation.
+var settingsMu sync.RWMutex
+
 // LoadDriverSettings loads settings.json into memory.
-// It does NOT send SETTINGS_CHANGED — callers that want to notify motordriver
-// must do so explicitly. This prevents a feedback loop where the
-// SETTINGS_CHANGED handler calls LoadDriverSettings which re-fires the channel.
 func LoadDriverSettings() error {
 	path := helper.AppendWDPath("/settings/settings.json")
 	settingsFile, err := ioutil.ReadFile(path)
 	if err != nil {
 		return err
 	}
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
 	return json.Unmarshal(settingsFile, &settingsRoot)
 }
 
 // LoadAndNotifyDriverSettings loads settings then notifies motordriver.
-// Call this from the REST API after a settings save — NOT from inside
-// a SETTINGS_CHANGED handler (that would create an infinite loop).
 func LoadAndNotifyDriverSettings() error {
 	if err := LoadDriverSettings(); err != nil {
 		return err
@@ -124,19 +137,22 @@ func LoadAndNotifyDriverSettings() error {
 }
 
 // SaveDriverSettings writes a single driver's settings back to settings.json.
-// Used by InitMaster to reanchor HomingOffset after encoder sign flip on power cycle.
+// Atomic write via temp file prevents corruption on power loss mid-write.
 func SaveDriverSettings(driverName string, ds DriverSettings) error {
+	settingsMu.Lock()
 	if settingsRoot == nil {
 		settingsRoot = make(SettingsRoot)
 	}
 	settingsRoot[driverName] = ds
-
-	path := helper.AppendWDPath("/settings/settings.json")
+	// Marshal while holding the lock so we snapshot a consistent state.
 	data, err := json.MarshalIndent(settingsRoot, "", "  ")
+	settingsMu.Unlock()
+
 	if err != nil {
 		return err
 	}
-	// Write atomically via temp file to avoid corrupting settings.json on power loss
+
+	path := helper.AppendWDPath("/settings/settings.json")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
@@ -144,10 +160,8 @@ func SaveDriverSettings(driverName string, ds DriverSettings) error {
 	return os.Rename(tmp, path)
 }
 
-// SaveHomingReference saves the encoder apos at zero-ref time.
-// This is the reference used by InitAposCorrection on each boot to compute
-// a transparent position correction for encoder sign flips.
-// HomingOffset (user setting) is never modified by the system.
+// SaveHomingReference saves the raw encoder apos at zero-ref time.
+// Called only by zero_reference.go after the motor has physically settled.
 func SaveHomingReference(driverName string, apos int32) error {
 	ds := GetDriverSettings(driverName)
 	ds.HomingApos = apos
@@ -155,10 +169,18 @@ func SaveHomingReference(driverName string, apos int32) error {
 }
 
 func GetAllSettings() map[string]DriverSettings {
-	return settingsRoot
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	copy := make(map[string]DriverSettings, len(settingsRoot))
+	for k, v := range settingsRoot {
+		copy[k] = v
+	}
+	return copy
 }
 
 func GetDriverSettings(driverName string) DriverSettings {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
 	return settingsRoot[driverName]
 }
 

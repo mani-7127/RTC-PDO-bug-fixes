@@ -26,6 +26,13 @@ var RS232Enabled atomic.Bool
 
 const lastLineFile = "/mnt/app/jamun/settings/last_line.txt"
 
+// lastProgramFile persists the name of the program that was last running
+// when execution stopped. Used to detect program switches — if the operator
+// selects a different program, the saved line number must be ignored and
+// execution starts from line 0. This matches industrial CNC behaviour:
+// resume only applies to the same program.
+const lastProgramFile = "/mnt/app/jamun/settings/last_program.txt"
+
 func SetRS232Enabled(enable bool) {
 	RS232Enabled.Store(enable)
 }
@@ -34,7 +41,6 @@ func IsRS232Enabled() bool {
 	return RS232Enabled.Load()
 }
 
-// Initialize executors to load plugins and parse execution yaml file.
 func Initialize() error {
 	var err error
 
@@ -55,7 +61,6 @@ func Initialize() error {
 
 	channels.SendAlarm("No Alarms")
 
-	// Boot must always start from beginning.
 	execContext.NextLineWhenStopped = 0
 	execContext.NextCmdLineToExec = 0
 
@@ -119,15 +124,30 @@ func clearLastLine() {
 	if err != nil {
 		logger.Error("Failed to clear last_line.txt:", err)
 	}
+	// Also clear the program name so a fresh boot starts from line 0
+	// for whichever program is selected first.
+	_ = os.WriteFile(lastProgramFile, []byte(""), 0644)
 }
 
 func saveLastLine(lineNumber int) {
 	lineStr := strconv.Itoa(lineNumber)
-
 	err := os.WriteFile(lastLineFile, []byte(lineStr), 0644)
 	if err != nil {
 		logger.Error("Failed to save execution state to last_line.txt:", err)
 	}
+}
+
+func saveLastProgram(fileName string) {
+	name := filepath.Base(fileName)
+	_ = os.WriteFile(lastProgramFile, []byte(name), 0644)
+}
+
+func readLastProgram() string {
+	content, err := os.ReadFile(lastProgramFile)
+	if err != nil {
+		return ""
+	}
+	return string(content)
 }
 
 func readLastLine() (int, error) {
@@ -138,43 +158,128 @@ func readLastLine() (int, error) {
 		}
 		return 0, err
 	}
-
-	lineStr := string(content)
-
-	lineNumber, err := strconv.Atoi(lineStr)
+	lineNumber, err := strconv.Atoi(string(content))
 	if err != nil {
 		return 0, err
 	}
-
 	return lineNumber, nil
 }
 
 // resolveStartLine decides where execution should begin.
 // Priority:
 // 1. explicit user-selected line (one-shot, UI is 1-based)
-// 2. stopped/resume line (internal index)
-// 3. beginning of program
-func resolveStartLine() int {
+// 2. stopped/resume line — BUT ONLY if the same program is being executed
+// 3. beginning of program (line 0)
+//
+// INDUSTRIAL CNC RULE: resume line is forgotten when a different program
+// is selected. If you stopped at line 8 of program LONG and now execute
+// program SHORT, SHORT starts at line 0. This prevents the line-8 saved
+// state from SHORT's program which only has 5 lines — causing an
+// out-of-bounds resume or skipping setup commands entirely.
+func resolveStartLine(currentFile string) int {
+	currentName := filepath.Base(currentFile)
+
+	// Priority 1: explicit user line selection from UI (one-shot).
 	userLine, err := settings.LoadLineNumberAsInt()
 	if err == nil && userLine > 0 {
 		startIdx := userLine - 1
 		if startIdx < 0 {
 			startIdx = 0
 		}
-		logger.Info("Starting from user-selected line:", userLine, " -> internal index:", startIdx)
-		settings.ClearLineNumber() // one-shot behavior
+		logger.Info("Starting from user-selected line:", userLine, "-> internal index:", startIdx)
+		settings.ClearLineNumber()
 		return startIdx
+	}
+
+	// Priority 2: resume from last stop — only if same program.
+	lastProgram := readLastProgram()
+	if lastProgram != currentName {
+		// Different program selected — forget the saved line.
+		// Clear it now so a subsequent stop saves correctly for this program.
+		if lastProgram != "" {
+			logger.Info("Program changed from", lastProgram, "to", currentName,
+				"— starting from line 0 (resume cleared)")
+		}
+		clearLastLine()
+		return 0
 	}
 
 	lastLine, err := readLastLine()
 	if err == nil && lastLine >= 0 {
 		if lastLine > 0 {
-			logger.Info("Resuming from last stopped internal index:", lastLine)
+			logger.Info("Resuming from last stopped internal index:", lastLine,
+				"program:", currentName)
 		}
 		return lastLine
 	}
 
 	return 0
+}
+
+// replaySetupCommands silently re-executes all non-motion setup commands
+// from lines 0..startLine-1 before resuming at startLine.
+//
+// WHY THIS IS NEEDED:
+// When a program is stopped mid-way (e.g. at line 6) and the operator runs
+// zero-ref or jogs before pressing Execute again, the drive's runtime state
+// (feedrate, ABS/INC mode, shortest path, workoffset) has been reset to
+// defaults. Resuming at line 6 without replaying lines 0-5 means the motor
+// runs at zero-ref speed instead of the programmed feedrate, and may use
+// the wrong mode (INC instead of ABS) if the program switches modes.
+//
+// Setup commands are identified by ConsiderInBlockExecution == 0 — these
+// are G01 F**, G90, G91, G68, G69, G17, workoffset commands, etc.
+// Motion commands (A**, B**) have ConsiderInBlockExecution == 1 and are
+// skipped — we do NOT want to re-execute any physical moves.
+//
+// This replicates what "reset + execute from beginning" does for the drive
+// context, without actually moving the table.
+func replaySetupCommands(commands []dt.Command, startLine int) {
+	if startLine <= 0 {
+		return
+	}
+
+	logger.Info("[RESUME] Replaying setup commands from lines 0 to", startLine-1,
+		"to restore feedrate/mode before resuming at line", startLine)
+
+	// Run in trial-mode equivalent: no ECS waits, no position moves,
+	// just the state changes (RPM, mode, workoffset, shortest path).
+	for i := 0; i < startLine && i < len(commands); i++ {
+		cmd := commands[i]
+		commandToExec := yamlConfig.Execution.GetCommand(cmd.Cmd)
+
+		// Skip motion commands entirely — we must not physically move the table.
+		if commandToExec.ConsiderInBlockExecution == 1 {
+			logger.Debug("[RESUME] Skipping motion command at line", i, ":", cmd.Cmd)
+			continue
+		}
+
+		// Skip M99/M30 loop/end markers — these affect execution flow.
+		if cmd.Cmd == "M99" || cmd.Cmd == "M30" {
+			logger.Debug("[RESUME] Skipping program flow command at line", i, ":", cmd.Cmd)
+			continue
+		}
+
+		funcToExec := funcMap[commandToExec.Func]
+		if funcToExec == nil {
+			continue
+		}
+		if reflect.ValueOf(funcToExec).Kind() == reflect.Ptr &&
+			reflect.ValueOf(funcToExec).IsNil() {
+			continue
+		}
+
+		cmd.ConsiderInBlockExecution = commandToExec.ConsiderInBlockExecution
+		logger.Debug("[RESUME] Replaying setup line", i, ":", cmd.Cmd)
+		funcToExec.Handle(cmd, &execContext)
+
+		// Allow async state changes (mode, shortest path) to propagate.
+		// These are sent via channels to driver_status_keeper, so a small
+		// sleep ensures they're applied before the first motion command runs.
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	logger.Info("[RESUME] Setup replay complete — drive context restored for line", startLine)
 }
 
 func RunCodeFile(fileName string) error {
@@ -207,18 +312,15 @@ func RunCodeFile(fileName string) error {
 
 	channels.NotifyMotorDriver(channels.START_EXECUTION, "", "", 0)
 
-	// IMPORTANT:
-	// Do NOT call ResetExecutingProgram() here.
+	// IMPORTANT: Do NOT call ResetExecutingProgram() here.
 	// That clears last_line.txt and userline.json before resolveStartLine() can use them.
-	// We only want to reset in-memory execution state for a fresh run attempt.
 	execContext.Reset()
 	execContext.ExecutingFilePath = fileName
 	execContext.Commands = commands
 	execContext.ECSEnabled = drvSettings.ECS
 	execContext.StopExecution = false
 
-	// Decide run start point only at execution time.
-	startLine := resolveStartLine()
+	startLine := resolveStartLine(fileName)
 	execContext.NextLineWhenStopped = startLine
 	execContext.NextCmdLineToExec = startLine
 
@@ -232,6 +334,21 @@ func RunCodeFile(fileName string) error {
 	execContext.NextLineWhenStopped = startLine
 	execContext.NextCmdLineToExec = startLine
 	execContext.StopExecution = false
+
+	// Save which program is running so resume logic knows whether to honour
+	// the saved line number or reset to 0 on next Execute.
+	saveLastProgram(fileName)
+
+	// If resuming mid-program, silently replay setup commands (feedrate, mode,
+	// shortest path) from lines before the resume point so the drive context
+	// is identical to what it would have been if the program ran from line 0.
+	//
+	// This fixes the issue where after zero-ref or jog, the motor resumes at
+	// zero-ref speed instead of the programmed feedrate because G01 F20 (line 0)
+	// was never executed for this resume cycle.
+	if startLine > 0 {
+		replaySetupCommands(commands, startLine)
+	}
 
 	logger.Trace("executing commands from", execContext.NextLineWhenStopped)
 
@@ -341,8 +458,6 @@ func executeCommands(commands []dt.Command, nextCommandIndex int) error {
 		if execContext.HasResetted {
 			execContext.NextLineWhenStopped = 0
 		} else {
-			// Resume the current command index.
-			// Prevent skipping a line that did not fully execute.
 			execContext.NextLineWhenStopped = nextCommandIndex
 		}
 
@@ -355,11 +470,8 @@ func executeCommands(commands []dt.Command, nextCommandIndex int) error {
 		return nil
 	}
 
-	// Respect handler-driven control flow (e.g. M99 loops).
-	// If the handler changed NextCmdLineToExec, keep it.
 	nextIdx := execContext.NextCmdLineToExec
 
-	// If handler did not change next index, advance normally.
 	if nextIdx == previousNextIdx || nextIdx == nextCommandIndex {
 		nextIdx = nextCommandIndex + 1
 		execContext.NextCmdLineToExec = nextIdx
@@ -448,27 +560,13 @@ func executeInLineParamFunction(funcToExec h.Handler, cmd dt.Command, execContex
 				}
 
 				if result.Cmd.ConsiderInBlockExecution == 1 {
-					execContext.WaitExecuteNextCommand()
+					// inline motion completed
+					_ = childResults
 				}
-
-				return executeInLineParamFunction(paramToExec, result.Cmd, execContext, childResults)
 			}
 		}
 	}
-
 	return nil
-}
-
-func ResumeExecution() error {
-	startLine := resolveStartLine()
-
-	execContext.StopExecution = false
-	execContext.NextLineWhenStopped = startLine
-	execContext.NextCmdLineToExec = startLine
-
-	logger.Info("resuming execution from line ", startLine)
-
-	return executeCommands(execContext.Commands, startLine)
 }
 
 func waitForProgramFileUpdate(filePath string) {
@@ -515,10 +613,6 @@ func UpdateLastLineFromJSON() {
 
 	execContext.NextLineWhenStopped = startIdx
 
-	// Keep compatibility with older callers that expect last_line.txt to reflect
-	// the selected restart line, but store internal zero-based index.
+	// Keep compatibility — last_line.txt reflects the selected restart line.
 	saveLastLine(startIdx)
-
-	logger.Info("Updated execContext.NextLineWhenStopped from userline.json:",
-		userLine, " -> internal index:", startIdx)
 }

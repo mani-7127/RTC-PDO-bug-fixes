@@ -2,8 +2,8 @@ package motordriver
 
 /**
 Position polling uses PDO feedback updated by the cyclic loop.
-getRawApos() is used instead of pdoFbActual.Load() directly so that the
-boot-time encoder sign-flip correction is applied transparently here.
+getRawApos() is used instead of pdoFbActual.Load() so that boot-time
+encoder sign-flip correction is applied transparently.
 **/
 
 import (
@@ -16,24 +16,36 @@ import (
 	"time"
 )
 
-var stopChan chan bool
+// stopChans is a per-device slice of stop channels.
+//
+// BUG FIX: Was a single shared chan bool. pollDrivePosition spawns one
+// goroutine per device, but stopDriverPolling only sent one message —
+// with 2+ devices, only the first goroutine stopped. The rest leaked,
+// keeping ghost position polling loops running after reset and causing
+// stale position broadcasts that interfered with the fresh poll loop.
+var stopChans []chan bool
 
 func pollDrivePosition(availableDevices []MasterDevice) error {
 	logger.Debug("starting driver position listener")
-	stopChan = make(chan bool)
+	stopChans = make([]chan bool, 0, len(availableDevices))
 	for _, device := range availableDevices {
-		go pollDrivePositionProcess(device)
+		ch := make(chan bool)
+		stopChans = append(stopChans, ch)
+		go pollDrivePositionProcess(device, ch)
 	}
 	return nil
 }
 
 func stopDriverPolling() {
-	if stopChan != nil {
-		stopChan <- true
+	for _, ch := range stopChans {
+		if ch != nil {
+			ch <- true
+		}
 	}
+	stopChans = nil
 }
 
-func pollDrivePositionProcess(device MasterDevice) {
+func pollDrivePositionProcess(device MasterDevice, stopChan chan bool) {
 	logger.Info("polling status of driver:", device.Name)
 
 	for {
@@ -41,18 +53,13 @@ func pollDrivePositionProcess(device MasterDevice) {
 		default:
 			driverSettings := settings.GetDriverSettings(device.Name)
 
-			// Wait until the cyclic loop has received at least one valid PDO frame
-			// (WC=COMPLETE) before reading position. Without this guard, the first
-			// broadcast to the UI uses a zero or stale value — showing wrong
-			// position on first boot.
+			// Wait for first valid PDO frame before reading position.
 			if !pdoDomainValid.Load() {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 
 			// getRawApos() applies sign-flip correction transparently.
-			// HomingOffset, pitch error, work offsets are all applied downstream
-			// in currentPosition() and the withErrCorr calculation — unchanged.
 			rawPosition := getRawApos()
 
 			driveStatus := getCurrentDriverStatus(device.Name)
@@ -73,11 +80,6 @@ func pollDrivePositionProcess(device MasterDevice) {
 				withErrCorr = 0
 			}
 
-			// Rate-limit HMI broadcasts to 50ms (20Hz).
-			// The human eye cannot perceive updates faster than ~24Hz, and
-			// socket.io + JSON encode at 100Hz floods the Pi's CPU and SD card,
-			// causing HMI lag. Motor control is unaffected — it runs via PDO
-			// atomics at 2ms cycle, independent of this display loop.
 			notifier.NotifyCurrentPosition(device.Name, withErrCorr)
 			currentDriverPosition(device, curPos)
 

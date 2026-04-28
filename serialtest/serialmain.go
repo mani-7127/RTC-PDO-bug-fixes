@@ -26,6 +26,11 @@ const (
 var executionInProgress atomic.Bool
 var fileUpdatedDuringExecution atomic.Bool
 
+// pendingCommand holds the last RS232 command received while execution was
+// in progress. Only the most recent command matters — older ones are
+// superseded. This prevents a queue of stale commands building up.
+var pendingCommand atomic.Value // stores string
+
 func StartSerialListener() {
 	cfg := &serial.Config{Name: serialDevice, Baud: baudRate, ReadTimeout: time.Millisecond * 200}
 	port, err := serial.OpenPort(cfg)
@@ -38,6 +43,7 @@ func StartSerialListener() {
 	logger.Info("RS-232 FILES updater + deferred executor started")
 	buf := make([]byte, 256)
 	frame := make([]byte, 0, 128)
+
 	for {
 		n, err := port.Read(buf)
 		if err != nil || n == 0 {
@@ -67,9 +73,15 @@ func handleRS232Command(cmd string) {
 	if cmd == "" {
 		return
 	}
+
 	parts := parseBatchCommands(cmd)
 	logger.Info("[RS232] Batch received:", cmd)
 	logger.Info("[RS232] Parsed commands:", strings.Join(parts, " | "))
+
+	// Validate every token BEFORE writing anything to FILES.
+	// If any token is invalid, reject the entire batch and log it.
+	// This prevents partial file updates from corrupt serial data.
+	normalized := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -77,38 +89,120 @@ func handleRS232Command(cmd string) {
 		}
 		norm := normalizeControllerToken(p)
 		if norm == "" {
-			continue
+			logger.Warn("[RS232] Invalid token in batch, rejecting entire command:", p, "from:", cmd)
+			return // reject the whole batch
 		}
-		logger.Info("[RS232] Command received:", norm)
-		if err := updateFILESFromRS232(norm); err != nil {
-			logger.Error("[RS232] FILES update failed:", err)
-			continue
-		}
-		logger.Info("[RS232] FILES updated with:", norm)
+		normalized = append(normalized, norm)
 	}
-	if executionInProgress.Load() {
-		fileUpdatedDuringExecution.Store(true)
-		logger.Warn("[RS232] Execution in progress, update deferred")
+
+	if len(normalized) == 0 {
+		logger.Warn("[RS232] No valid commands after normalization, ignoring:", cmd)
 		return
 	}
+
+	// All tokens valid — now update FILES atomically.
+	for _, norm := range normalized {
+		if err := updateFILESFromRS232(norm); err != nil {
+			logger.Error("[RS232] FILES update failed for token:", norm, "error:", err)
+			// Still continue with remaining valid tokens.
+		} else {
+			logger.Info("[RS232] FILES updated with:", norm)
+		}
+	}
+
+	if executionInProgress.Load() {
+		// Execution is running — mark that the file was updated so
+		// executeFilesProgramOnce will re-run after the current execution ends.
+		fileUpdatedDuringExecution.Store(true)
+		// Store the raw command so we can log what triggered the re-run.
+		pendingCommand.Store(cmd)
+		logger.Warn("[RS232] Execution in progress, update deferred for next cycle")
+		return
+	}
+
+	// No execution running — start one.
 	executionInProgress.Store(true)
 	go executeFilesProgramOnce()
 }
 
-// existing helper functions unchanged below ...
-// parseBatchCommands supports these controller styles:
+// ------------------------------------------------------------
+// EXECUTION LOGIC
+// ------------------------------------------------------------
+
+func executeFilesProgramOnce() {
+	defer executionInProgress.Store(false)
+
+	logger.Info("[RS232] Preparing program execution")
+
+	// Stop any partially running program and reset state cleanly.
+	channels.WriteCommandExecInput("stop_prog_exec", "")
+	executors.ResetExecutingProgram()
+	time.Sleep(200 * time.Millisecond)
+
+	// Sync position so move calculations start from the real encoder value.
+	motor.RefreshCurrentPosition()
+
+	// Wait for the drive to settle after reset before issuing moves.
+	// 2 seconds gives the PDO cyclic loop time to re-establish valid frames.
+	time.Sleep(2 * time.Second)
+
+	file := helper.GetCodeFilePath() + "/FILES"
+
+	// Verify the file exists and is readable before attempting execution.
+	// If it doesn't exist, log and return — don't crash or hang.
+	if _, err := os.Stat(file); err != nil {
+		logger.Error("[RS232] Program file not found or not accessible:", file, "error:", err)
+		// Drain any deferred update flag — no point re-running if file is missing.
+		fileUpdatedDuringExecution.Store(false)
+		return
+	}
+
+	// Read and log the file content before execution so we have an audit trail
+	// of exactly what program was run from this RS232 command.
+	if content, err := os.ReadFile(file); err == nil {
+		logger.Info("[RS232] Executing file content:\n", string(content))
+	}
+
+	logger.Info("[RS232] EXECUTING Program:", file)
+
+	executors.SetRS232Enabled(true)
+	defer executors.SetRS232Enabled(false)
+
+	if err := executors.RunCodeFile(file); err != nil {
+		logger.Error("[RS232] Program execution failed:", err)
+	} else {
+		logger.Info("[RS232] Program execution completed successfully")
+	}
+
+	// If the file was updated while we were executing, run again immediately
+	// with the latest content. This handles the case where the machine sends
+	// a new position command before the previous program cycle finishes.
+	if fileUpdatedDuringExecution.Load() {
+		pending, _ := pendingCommand.Load().(string)
+		logger.Info("[RS232] Deferred update detected, re-executing latest program. Triggered by:", pending)
+		fileUpdatedDuringExecution.Store(false)
+		pendingCommand.Store("")
+		executionInProgress.Store(true)
+		go executeFilesProgramOnce()
+	}
+}
+
+// ------------------------------------------------------------
+// PARSER: parseBatchCommands
+// Supports these controller styles:
 //
-// 1) Concatenated: "G01F20G91G68A90"   -> ["G01F20","G91","G68","A90"]
-// 2) Space-batch:  "G01 F20 G91 G68 A90;" -> ["G01 F20","G91","G68","A90"]
-// 3) Comma-batch:  "go1f20,g91,g68,a90"   -> ["go1f20","g91","g68","a90"]
-// 4) Multi-; batch: "G01 F20;G91;A90;"    -> ["G01 F20","G91","A90"]
+//  1. Concatenated: "G01F20G91G68A90"       -> ["G01F20","G91","G68","A90"]
+//  2. Space-batch:  "G01 F20 G91 G68 A90;"  -> ["G01 F20","G91","G68","A90"]
+//  3. Comma-batch:  "go1f20,g91,g68,a90"    -> ["go1f20","g91","g68","a90"]
+//  4. Multi-;:      "G01 F20;G91;A90;"      -> ["G01 F20","G91","A90"]
+// ------------------------------------------------------------
+
 func parseBatchCommands(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil
 	}
 
-	// If multiple commands are already ';' separated, split those first
 	if strings.Count(s, ";") > 1 {
 		raw := strings.Split(s, ";")
 		out := make([]string, 0, len(raw))
@@ -121,11 +215,9 @@ func parseBatchCommands(s string) []string {
 		return out
 	}
 
-	// Remove a single trailing ';' (batch terminator)
 	s = strings.TrimSuffix(s, ";")
 	s = strings.TrimSpace(s)
 
-	// Comma-batch: "go1f20,g91,g68,a90"
 	if strings.Contains(s, ",") {
 		raw := strings.Split(s, ",")
 		out := make([]string, 0, len(raw))
@@ -138,7 +230,6 @@ func parseBatchCommands(s string) []string {
 		return out
 	}
 
-	// Space-batch: "G01 F20 G91 G68 A90"
 	if strings.Contains(s, " ") || strings.Contains(s, "\t") {
 		toks := strings.Fields(s)
 		if len(toks) == 0 {
@@ -183,29 +274,23 @@ func parseBatchCommands(s string) []string {
 				cur = append(cur, t)
 				continue
 			}
-
 			if len(cur) > 0 && isParam(t) {
 				cur = append(cur, t)
 				continue
 			}
-
 			if len(cur) > 0 {
 				cur = append(cur, t)
 			}
 		}
-
 		if len(cur) > 0 {
 			out = append(out, strings.Join(cur, " "))
 		}
 		return out
 	}
 
-	// ✅ Concatenated: "G01F20G91G68A90"
 	return splitConcatenatedBatch(s)
 }
 
-// Splits concatenated controller strings like:
-// "G01F20G91G68A90" -> ["G01F20","G91","G68","A90"]
 func splitConcatenatedBatch(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -214,10 +299,6 @@ func splitConcatenatedBatch(s string) []string {
 
 	u := strings.ToUpper(s)
 
-	// New command starts at:
-	// - any 'G' or 'M'
-	// - axis vars you care about: A/B/D
-	// Note: We do NOT use X/Y/Z here because those are usually parameters of G01.
 	isStart := func(c byte) bool {
 		switch c {
 		case 'G', 'M', 'A', 'B', 'D':
@@ -231,36 +312,28 @@ func splitConcatenatedBatch(s string) []string {
 	i := 0
 
 	for i < len(u) {
-		// Skip whitespace/junk
 		if u[i] == ' ' || u[i] == '\t' {
 			i++
 			continue
 		}
-
 		if !isStart(u[i]) {
 			i++
 			continue
 		}
-
 		start := i
-		i++ // consume letter
-
-		// Consume digits for G/M number
+		i++
 		if u[start] == 'G' || u[start] == 'M' {
 			for i < len(u) && u[i] >= '0' && u[i] <= '9' {
 				i++
 			}
-			// Consume until next start (parameters like F20 will be included here)
 			for i < len(u) && !isStart(u[i]) {
 				i++
 			}
 		} else {
-			// Axis var like A90/B20/D3: consume until next start
 			for i < len(u) && !isStart(u[i]) {
 				i++
 			}
 		}
-
 		token := strings.TrimSpace(s[start:i])
 		if token != "" {
 			out = append(out, token)
@@ -270,12 +343,15 @@ func splitConcatenatedBatch(s string) []string {
 	return out
 }
 
-// Converts one parsed token into a proper FILES line.
+// normalizeControllerToken converts a parsed token into a proper FILES line.
+// Returns empty string if the token is not recognizable — caller must reject.
+//
 // Examples:
-//   "G01F20" -> "G01 F20;"
-//   "G91"    -> "G91;"
-//   "A90"    -> "A90;"
-//   "45"     -> "A45;"   (legacy numeric-only)
+//
+//	"G01F20" -> "G01 F20;"
+//	"G91"    -> "G91;"
+//	"A90"    -> "A90;"
+//	"45"     -> "A45;"   (legacy numeric-only)
 func normalizeControllerToken(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -287,29 +363,34 @@ func normalizeControllerToken(s string) string {
 		return fmt.Sprintf("A%g;", v)
 	}
 
-	// remove trailing ';' (we add it back)
 	s = strings.TrimSuffix(s, ";")
-
-	// commas inside token -> spaces (just in case)
 	s = strings.ReplaceAll(s, ",", " ")
-
-	// uppercase
 	s = strings.ToUpper(s)
 
-	// handle GO1 -> G01 (letter O instead of 0)
+	// Fix GO1 -> G01 (letter O instead of zero, common typo)
 	if strings.HasPrefix(s, "GO") && len(s) >= 3 {
 		s = "G0" + s[2:]
 	}
 
-	// Insert spaces before param letters for G/M tokens (G01F20 -> G01 F20)
-	if len(s) > 0 && (s[0] == 'G' || s[0] == 'M') {
+	// Validate: must start with a known command letter.
+	// Reject anything that doesn't — prevents garbage from corrupting FILES.
+	if len(s) == 0 {
+		return ""
+	}
+	switch s[0] {
+	case 'G', 'M', 'A', 'B', 'X', 'Y', 'Z', 'D', 'F':
+		// valid
+	default:
+		logger.Warn("[RS232] Unrecognized command token rejected:", s)
+		return ""
+	}
+
+	if s[0] == 'G' || s[0] == 'M' {
 		s = insertSpacesBeforeLetters(s)
 	}
 
-	// collapse spaces
 	s = strings.Join(strings.Fields(s), " ")
 
-	// ensure terminator
 	if !strings.HasSuffix(s, ";") {
 		s += ";"
 	}
@@ -359,12 +440,8 @@ func findInsertBeforeEnd(lines []string) int {
 	return len(lines)
 }
 
-// updateFILESFromRS232 updates gm_codes/FILES according to rules:
-//
-// - Axis letters (A/B/X/Y/Z/D): match by letter only (A90 replaces any A...)
-// - G/M: exact token match (G01 replaces G01 ...)
-// - Special: if controller sends G91 and file has G90 -> replace G90 with G91 (and vice versa)
-// - If not found: insert BEFORE M99/M30 (never after)
+// updateFILESFromRS232 updates gm_codes/FILES atomically.
+// Writes via temp file + rename to prevent partial writes on power loss.
 func updateFILESFromRS232(oneCmd string) error {
 	oneCmd = strings.TrimSpace(oneCmd)
 	if oneCmd == "" {
@@ -429,7 +506,7 @@ func updateFILESFromRS232(oneCmd string) error {
 		lines = append(lines[:idx], append([]string{oneCmd}, lines[idx:]...)...)
 	}
 
-	// Atomic write
+	// Atomic write via temp file
 	tmpPath := filesPath + ".tmp"
 	data := strings.Join(lines, "\n")
 	if !strings.HasSuffix(data, "\n") {
@@ -444,38 +521,4 @@ func updateFILESFromRS232(oneCmd string) error {
 	}
 
 	return nil
-}
-
-// ------------------------------------------------------------
-// EXECUTION LOGIC (ONE-SHOT, DEFERRED)
-// ------------------------------------------------------------
-
-func executeFilesProgramOnce() {
-	defer executionInProgress.Store(false)
-
-	logger.Warn("[RS232] Preparing program execution")
-	channels.WriteCommandExecInput("stop_prog_exec", "")
-	executors.ResetExecutingProgram()
-	time.Sleep(200 * time.Millisecond)
-	motor.RefreshCurrentPosition()
-	time.Sleep(2 * time.Second)
-
-	file := helper.GetCodeFilePath() + "/FILES"
-	logger.Info("[RS232] EXECUTING Program:", file)
-
-	executors.SetRS232Enabled(true)
-	defer executors.SetRS232Enabled(false)
-
-	if err := executors.RunCodeFile(file); err != nil {
-		logger.Error("[RS232] Program execution failed:", err)
-	} else {
-		logger.Info("[RS232] Program execution completed")
-	}
-
-	if fileUpdatedDuringExecution.Load() {
-		logger.Info("[RS232] Detected FILES update during execution, executing latest program")
-		fileUpdatedDuringExecution.Store(false)
-		executionInProgress.Store(true)
-		go executeFilesProgramOnce()
-	}
 }

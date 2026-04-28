@@ -30,6 +30,21 @@ func getRawApos() int32 {
 	return v
 }
 
+// correctedToCmdTarget converts a corrected position back to the drive raw
+// coordinate space for writing to pdoCmdTarget (0x607A).
+//
+// getRawApos() negates pdoFbActual when signFlipActive=true so all code sees
+// consistent positive values. But pdoCmdTarget is sent to the drive hardware
+// which operates in its own raw space. Storing a corrected (+) value when the
+// drive apos is negative makes the drive travel ~2x the position — hundreds of
+// rotations. This function converts back so pdoCmdTarget is always in raw space.
+func correctedToCmdTarget(correctedPos int32) int32 {
+	if signFlipActive.Load() {
+		return -correctedPos
+	}
+	return correctedPos
+}
+
 // InitAposCorrection is called once per boot from InitMaster, after the drive
 // is powered and the first valid PDO frame has been received.
 //
@@ -56,25 +71,26 @@ func InitAposCorrection(driveName string) {
 
 	bootApos := pdoFbActual.Load() // raw, before any correction
 
-	// Condition 1: signs must be opposite.
-	if (bootApos > 0) == (homingApos > 0) {
-		logger.Info("InitAposCorrection: same sign — no correction needed",
-			"drive=", driveName,
-			"bootApos=", bootApos,
-			"HomingApos=", homingApos,
-		)
-		return
-	}
-
-	// Condition 2: magnitudes within 15%.
+	// Use magnitude-only comparison. HomingApos is always saved as a
+	// normalized negative value (see zero_reference.go). bootApos is raw
+	// from the drive — negative on normal boot, positive on sign-flip boot.
+	// We only need to know: did the sign flip? That means bootApos is
+	// positive (opposite of the always-negative HomingApos).
+	//
+	// Old approach compared signs directly — broke when zero-ref was done
+	// during a flipped boot (HomingApos saved positive), causing the
+	// display to show 3.174° or 356.826° instead of 0.000° on next boot.
 	bootMag := math.Abs(float64(bootApos))
 	homeMag := math.Abs(float64(homingApos))
+
 	if homeMag < 1 {
 		logger.Info("InitAposCorrection: HomingApos magnitude too small — no correction",
 			"drive=", driveName,
 		)
 		return
 	}
+
+	// Condition: magnitudes within 15% (same physical position).
 	ratioDiff := math.Abs((bootMag/homeMag) - 1.0)
 	if ratioDiff > 0.15 {
 		logger.Info("InitAposCorrection: magnitude mismatch — no correction (table may have moved)",
@@ -86,14 +102,24 @@ func InitAposCorrection(driveName string) {
 		return
 	}
 
-	// Both conditions met: sign flip confirmed.
-	signFlipActive.Store(true)
-	logger.Info("InitAposCorrection: sign flip confirmed — negating apos transparently",
-		"drive=", driveName,
-		"bootApos=", bootApos,
-		"HomingApos=", homingApos,
-		"ratioDiff%=", fmt.Sprintf("%.2f%%", ratioDiff*100),
-	)
+	// Magnitudes match. Now check if a sign flip occurred:
+	// HomingApos is always negative (normalized). If bootApos is positive,
+	// the drive flipped sign — apply correction.
+	if bootApos > 0 {
+		signFlipActive.Store(true)
+		logger.Info("InitAposCorrection: sign flip confirmed — negating apos transparently",
+			"drive=", driveName,
+			"bootApos=", bootApos,
+			"HomingApos=", homingApos,
+			"ratioDiff%=", fmt.Sprintf("%.2f%%", ratioDiff*100),
+		)
+	} else {
+		logger.Info("InitAposCorrection: same sign — no correction needed",
+			"drive=", driveName,
+			"bootApos=", bootApos,
+			"HomingApos=", homingApos,
+		)
+	}
 }
 
 // getPulsesFromDegree returns the pulse count to send to the drive.
@@ -107,11 +133,24 @@ func getPulsesFromDegree(masterDevice MasterDevice, degree float64) int64 {
 
 // currentPosition converts encoder pulses → degrees [0, 360).
 // pos must come from getRawApos() — sign-flip correction is applied there.
-// HomingOffset is applied here as normal and is never modified by sign-flip logic.
+//
+// After our sign-flip architecture change, getRawApos() ALWAYS returns a
+// value in the NEGATIVE coordinate space when the table is near zero
+// (e.g. -554431729). This is consistent across all boots.
+//
+// However, the customer's HomingOffset (e.g. 1.587°) was originally set
+// when the old code returned POSITIVE values for the same position. So the
+// stored HomingOffset has the opposite sign for our new coordinate space.
+// We negate it here to compensate. The customer never needs to change their
+// HomingOffset setting.
 func currentPosition(pos int32, driveXRatio int, driveName string) (float64, float64) {
 	driverSettings := settings.GetDriverSettings(driveName)
 
-	driveOffset := driverSettings.HomingOffset * float32(driveXRatio)
+	// Negate HomingOffset because getRawApos() now returns normalized
+	// negative values, but the customer calibrated when pos was positive.
+	homingOffset := -driverSettings.HomingOffset
+
+	driveOffset := homingOffset * float32(driveXRatio)
 	drivePosition := float64(pos) - float64(driveOffset)
 	drivePosition = drivePosition / float64(driveXRatio)
 
