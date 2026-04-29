@@ -48,13 +48,15 @@ func correctedToCmdTarget(correctedPos int32) int32 {
 // InitAposCorrection is called once per boot from InitMaster, after the drive
 // is powered and the first valid PDO frame has been received.
 //
-// It sets signFlipActive=true ONLY when both conditions hold:
-//  1. bootApos and HomingApos have OPPOSITE signs.
-//  2. Their magnitudes are within 15% of each other
-//     (same physical shaft, multi-turn counter wrapped to other side).
+// It sets signFlipActive=true when bootApos is POSITIVE and HomingApos is
+// NEGATIVE (the only valid sign combination indicating a flip).
 //
-// All other cases (Pi-only restart, no HomingApos saved, table physically
-// moved while powered off) leave signFlipActive=false — zero changes.
+// HomingApos is always saved as a normalized negative value by zero_reference.go.
+// So the sign of bootApos alone is sufficient to detect a flip — no magnitude
+// comparison is needed or wanted. The old 15% magnitude gate was incorrectly
+// blocking the correction when the operator stopped the table at a different
+// position before powering off (which caused bootApos magnitude to differ from
+// HomingApos magnitude even though a sign flip had still occurred).
 func InitAposCorrection(driveName string) {
 	signFlipActive.Store(false)
 
@@ -71,15 +73,6 @@ func InitAposCorrection(driveName string) {
 
 	bootApos := pdoFbActual.Load() // raw, before any correction
 
-	// Use magnitude-only comparison. HomingApos is always saved as a
-	// normalized negative value (see zero_reference.go). bootApos is raw
-	// from the drive — negative on normal boot, positive on sign-flip boot.
-	// We only need to know: did the sign flip? That means bootApos is
-	// positive (opposite of the always-negative HomingApos).
-	//
-	// Old approach compared signs directly — broke when zero-ref was done
-	// during a flipped boot (HomingApos saved positive), causing the
-	// display to show 3.174° or 356.826° instead of 0.000° on next boot.
 	bootMag := math.Abs(float64(bootApos))
 	homeMag := math.Abs(float64(homingApos))
 
@@ -90,21 +83,19 @@ func InitAposCorrection(driveName string) {
 		return
 	}
 
-	// Condition: magnitudes within 15% (same physical position).
+	// Sign-only check. HomingApos is always saved as negative (zero_reference.go
+	// normalizes it). bootApos positive = sign flip occurred. No magnitude gate —
+	// the table may have physically moved between power cycles AND the sign may
+	// have flipped simultaneously. The old 15% magnitude gate blocked the
+	// correction in exactly that case (operator parks table at any position).
 	ratioDiff := math.Abs((bootMag/homeMag) - 1.0)
-	if ratioDiff > 0.15 {
-		logger.Info("InitAposCorrection: magnitude mismatch — no correction (table may have moved)",
-			"drive=", driveName,
-			"bootApos=", bootApos,
-			"HomingApos=", homingApos,
-			"ratioDiff%=", fmt.Sprintf("%.2f%%", ratioDiff*100),
-		)
-		return
-	}
+	logger.Info("InitAposCorrection: checking sign",
+		"drive=", driveName,
+		"bootApos=", bootApos,
+		"HomingApos=", homingApos,
+		"ratioDiff%=", fmt.Sprintf("%.2f%%", ratioDiff*100),
+	)
 
-	// Magnitudes match. Now check if a sign flip occurred:
-	// HomingApos is always negative (normalized). If bootApos is positive,
-	// the drive flipped sign — apply correction.
 	if bootApos > 0 {
 		signFlipActive.Store(true)
 		logger.Info("InitAposCorrection: sign flip confirmed — negating apos transparently",

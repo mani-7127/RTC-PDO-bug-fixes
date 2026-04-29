@@ -20,8 +20,14 @@ import (
 const (
 	serialDevice = "/dev/ttyUSB0"
 	baudRate     = 9600
-	filesPath    = "/mnt/app/jamun/gm_codes/FILES"
 )
+
+// getFilesPath returns the correct FILES path regardless of run location.
+// Using helper.GetCodeFilePath() avoids the hardcoded /mnt/app/jamun path
+// that broke execution when running from the dev directory.
+func getFilesPath() string {
+	return helper.GetCodeFilePath() + "/FILES"
+}
 
 var executionInProgress atomic.Bool
 var fileUpdatedDuringExecution atomic.Bool
@@ -80,7 +86,6 @@ func handleRS232Command(cmd string) {
 
 	// Validate every token BEFORE writing anything to FILES.
 	// If any token is invalid, reject the entire batch and log it.
-	// This prevents partial file updates from corrupt serial data.
 	normalized := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
@@ -90,7 +95,7 @@ func handleRS232Command(cmd string) {
 		norm := normalizeControllerToken(p)
 		if norm == "" {
 			logger.Warn("[RS232] Invalid token in batch, rejecting entire command:", p, "from:", cmd)
-			return // reject the whole batch
+			return
 		}
 		normalized = append(normalized, norm)
 	}
@@ -100,29 +105,168 @@ func handleRS232Command(cmd string) {
 		return
 	}
 
-	// All tokens valid — now update FILES atomically.
-	for _, norm := range normalized {
-		if err := updateFILESFromRS232(norm); err != nil {
-			logger.Error("[RS232] FILES update failed for token:", norm, "error:", err)
-			// Still continue with remaining valid tokens.
-		} else {
-			logger.Info("[RS232] FILES updated with:", norm)
+	// All tokens valid — rebuild FILES atomically from the full batch.
+	// rebuildFILES enforces strict line ordering and G68 rules.
+	if err := rebuildFILES(normalized); err != nil {
+		logger.Error("[RS232] rebuildFILES failed, falling back to token update:", err)
+		for _, norm := range normalized {
+			if err2 := updateFILESFromRS232(norm); err2 != nil {
+				logger.Error("[RS232] FILES update failed for token:", norm, "error:", err2)
+			} else {
+				logger.Info("[RS232] FILES updated with:", norm)
+			}
 		}
+	} else {
+		logger.Info("[RS232] FILES rebuilt successfully from batch:", cmd)
 	}
 
 	if executionInProgress.Load() {
-		// Execution is running — mark that the file was updated so
-		// executeFilesProgramOnce will re-run after the current execution ends.
+		// Interrupt the currently running executor immediately so it exits
+		// RunCodeFile and returns. The deferred command will then execute
+		// cleanly in the re-launch of executeFilesProgramOnce.
+		// Without this, the old execution stays blocked in doECSCheck or
+		// waitForProgramFileUpdate indefinitely.
+		channels.WriteCommandExecInput("stop_prog_exec", "")
 		fileUpdatedDuringExecution.Store(true)
-		// Store the raw command so we can log what triggered the re-run.
 		pendingCommand.Store(cmd)
-		logger.Warn("[RS232] Execution in progress, update deferred for next cycle")
+		logger.Warn("[RS232] Execution interrupted + queued:", cmd)
 		return
 	}
 
-	// No execution running — start one.
 	executionInProgress.Store(true)
 	go executeFilesProgramOnce()
+}
+
+// ------------------------------------------------------------
+// FILES REBUILD
+// Constructs FILES from scratch with strict line ordering:
+//
+//   G01 F<n>;     — feedrate (always first)
+//   G90; / G91;   — absolute / incremental mode
+//   [G68;]        — shortest path (G90 only, omitted in G91)
+//   A<deg>;       — target axis position
+//   M99;          — loop back
+//
+// G68 rules:
+//   G91 sent       → G68 removed (not valid in incremental mode)
+//   G90 + G68 sent → G68 added after G90 line
+//   G90 no G68     → G68 omitted
+// ------------------------------------------------------------
+
+func rebuildFILES(normalized []string) error {
+	var feedrate, modeCmd, axisCmd string
+	var hasG68 bool
+
+	for _, tok := range normalized {
+		u := upperTrim(tok)
+		switch {
+		case isFeedrate(u):
+			feedrate = tok
+		case u == "G90":
+			modeCmd = "G90;"
+		case u == "G91":
+			modeCmd = "G91;"
+		case u == "G68":
+			hasG68 = true
+		case u == "G69":
+			hasG68 = false
+			if modeCmd == "" {
+				modeCmd = "G90;"
+			}
+		case isAxisKey(u):
+			axisCmd = tok
+		}
+	}
+
+	// Fall back to existing FILES content for any field not supplied.
+	existingFeedrate, existingAxis, existingMode := readExistingFILES()
+	if feedrate == "" {
+		feedrate = firstNonEmpty(existingFeedrate, "G01 F20;")
+	}
+	if axisCmd == "" {
+		axisCmd = firstNonEmpty(existingAxis, "A0;")
+	}
+	if modeCmd == "" {
+		modeCmd = firstNonEmpty(existingMode, "G90;")
+	}
+
+	lines := []string{feedrate, modeCmd}
+
+	if strings.HasPrefix(modeCmd, "G90") {
+		if hasG68 {
+			lines = append(lines, "G68;")
+			logger.Info("[RS232] G68 added — absolute mode with shortest path")
+		} else {
+			logger.Info("[RS232] G68 omitted — absolute mode without shortest path")
+		}
+	} else if hasG68 {
+		logger.Info("[RS232] G68 removed — not valid in incremental (G91) mode")
+	}
+
+	lines = append(lines, axisCmd, "M99;")
+
+	logger.Info("[RS232] Rebuilding FILES:")
+	for i, l := range lines {
+		logger.Info(fmt.Sprintf("[RS232]   line %d: %s", i, l))
+	}
+
+	return writeFILESAtomic(lines)
+}
+
+func readExistingFILES() (feedrate, axis, mode string) {
+	content, err := os.ReadFile(getFilesPath())
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		lt := strings.TrimSpace(line)
+		if lt == "" {
+			continue
+		}
+		u := upperTrim(lt)
+		switch {
+		case isFeedrate(u):
+			feedrate = lt
+		case u == "G90" || u == "G91":
+			mode = lt
+		case isAxisKey(u):
+			axis = lt
+		}
+	}
+	return
+}
+
+func upperTrim(s string) string {
+	return strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), ";")))
+}
+
+func isFeedrate(upper string) bool {
+	return strings.HasPrefix(upper, "G01") || strings.HasPrefix(upper, "G1 ") ||
+		(strings.HasPrefix(upper, "G0 ") && strings.Contains(upper, "F"))
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func writeFILESAtomic(lines []string) error {
+	data := strings.Join(lines, "\n")
+	if !strings.HasSuffix(data, "\n") {
+		data += "\n"
+	}
+	tmp := getFilesPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(data), 0644); err != nil {
+		return fmt.Errorf("failed to write temp FILES: %w", err)
+	}
+	if err := os.Rename(tmp, getFilesPath()); err != nil {
+		return fmt.Errorf("failed to rename FILES: %w", err)
+	}
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -134,31 +278,21 @@ func executeFilesProgramOnce() {
 
 	logger.Info("[RS232] Preparing program execution")
 
-	// Stop any partially running program and reset state cleanly.
 	channels.WriteCommandExecInput("stop_prog_exec", "")
 	executors.ResetExecutingProgram()
 	time.Sleep(200 * time.Millisecond)
 
-	// Sync position so move calculations start from the real encoder value.
 	motor.RefreshCurrentPosition()
-
-	// Wait for the drive to settle after reset before issuing moves.
-	// 2 seconds gives the PDO cyclic loop time to re-establish valid frames.
 	time.Sleep(2 * time.Second)
 
-	file := helper.GetCodeFilePath() + "/FILES"
+	file := getFilesPath()
 
-	// Verify the file exists and is readable before attempting execution.
-	// If it doesn't exist, log and return — don't crash or hang.
 	if _, err := os.Stat(file); err != nil {
 		logger.Error("[RS232] Program file not found or not accessible:", file, "error:", err)
-		// Drain any deferred update flag — no point re-running if file is missing.
 		fileUpdatedDuringExecution.Store(false)
 		return
 	}
 
-	// Read and log the file content before execution so we have an audit trail
-	// of exactly what program was run from this RS232 command.
 	if content, err := os.ReadFile(file); err == nil {
 		logger.Info("[RS232] Executing file content:\n", string(content))
 	}
@@ -174,9 +308,6 @@ func executeFilesProgramOnce() {
 		logger.Info("[RS232] Program execution completed successfully")
 	}
 
-	// If the file was updated while we were executing, run again immediately
-	// with the latest content. This handles the case where the machine sends
-	// a new position command before the previous program cycle finishes.
 	if fileUpdatedDuringExecution.Load() {
 		pending, _ := pendingCommand.Load().(string)
 		logger.Info("[RS232] Deferred update detected, re-executing latest program. Triggered by:", pending)
@@ -188,13 +319,7 @@ func executeFilesProgramOnce() {
 }
 
 // ------------------------------------------------------------
-// PARSER: parseBatchCommands
-// Supports these controller styles:
-//
-//  1. Concatenated: "G01F20G91G68A90"       -> ["G01F20","G91","G68","A90"]
-//  2. Space-batch:  "G01 F20 G91 G68 A90;"  -> ["G01 F20","G91","G68","A90"]
-//  3. Comma-batch:  "go1f20,g91,g68,a90"    -> ["go1f20","g91","g68","a90"]
-//  4. Multi-;:      "G01 F20;G91;A90;"      -> ["G01 F20","G91","A90"]
+// PARSER
 // ------------------------------------------------------------
 
 func parseBatchCommands(s string) []string {
@@ -264,7 +389,6 @@ func parseBatchCommands(s string) []string {
 
 		var out []string
 		var cur []string
-
 		for _, t := range toks {
 			if isCmdStart(t) {
 				if len(cur) > 0 {
@@ -310,7 +434,6 @@ func splitConcatenatedBatch(s string) []string {
 
 	var out []string
 	i := 0
-
 	for i < len(u) {
 		if u[i] == ' ' || u[i] == '\t' {
 			i++
@@ -334,31 +457,19 @@ func splitConcatenatedBatch(s string) []string {
 				i++
 			}
 		}
-		token := strings.TrimSpace(s[start:i])
-		if token != "" {
+		if token := strings.TrimSpace(s[start:i]); token != "" {
 			out = append(out, token)
 		}
 	}
-
 	return out
 }
 
-// normalizeControllerToken converts a parsed token into a proper FILES line.
-// Returns empty string if the token is not recognizable — caller must reject.
-//
-// Examples:
-//
-//	"G01F20" -> "G01 F20;"
-//	"G91"    -> "G91;"
-//	"A90"    -> "A90;"
-//	"45"     -> "A45;"   (legacy numeric-only)
 func normalizeControllerToken(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
 
-	// Legacy numeric-only => A<number>;
 	if v, err := strconv.ParseFloat(s, 64); err == nil {
 		return fmt.Sprintf("A%g;", v)
 	}
@@ -367,19 +478,15 @@ func normalizeControllerToken(s string) string {
 	s = strings.ReplaceAll(s, ",", " ")
 	s = strings.ToUpper(s)
 
-	// Fix GO1 -> G01 (letter O instead of zero, common typo)
 	if strings.HasPrefix(s, "GO") && len(s) >= 3 {
 		s = "G0" + s[2:]
 	}
 
-	// Validate: must start with a known command letter.
-	// Reject anything that doesn't — prevents garbage from corrupting FILES.
 	if len(s) == 0 {
 		return ""
 	}
 	switch s[0] {
 	case 'G', 'M', 'A', 'B', 'X', 'Y', 'Z', 'D', 'F':
-		// valid
 	default:
 		logger.Warn("[RS232] Unrecognized command token rejected:", s)
 		return ""
@@ -391,6 +498,10 @@ func normalizeControllerToken(s string) string {
 
 	s = strings.Join(strings.Fields(s), " ")
 
+	if strings.HasPrefix(s, "G0 F") {
+		s = "G01" + s[2:]
+	}
+
 	if !strings.HasSuffix(s, ";") {
 		s += ";"
 	}
@@ -401,12 +512,8 @@ func insertSpacesBeforeLetters(s string) string {
 	var out []rune
 	var prev rune
 	for i, r := range s {
-		if i > 0 {
-			isLetter := (r >= 'A' && r <= 'Z')
-			isPrevDigit := (prev >= '0' && prev <= '9')
-			if isLetter && isPrevDigit {
-				out = append(out, ' ')
-			}
+		if i > 0 && (r >= 'A' && r <= 'Z') && (prev >= '0' && prev <= '9') {
+			out = append(out, ' ')
 		}
 		out = append(out, r)
 		prev = r
@@ -415,7 +522,7 @@ func insertSpacesBeforeLetters(s string) string {
 }
 
 // ------------------------------------------------------------
-// FILE UPDATE LOGIC
+// FILE UPDATE HELPERS
 // ------------------------------------------------------------
 
 func isAxisKey(k string) bool {
@@ -440,8 +547,8 @@ func findInsertBeforeEnd(lines []string) int {
 	return len(lines)
 }
 
-// updateFILESFromRS232 updates gm_codes/FILES atomically.
-// Writes via temp file + rename to prevent partial writes on power loss.
+// updateFILESFromRS232 is the fallback token-by-token updater used when
+// rebuildFILES fails. Kept for safety — should rarely be reached.
 func updateFILESFromRS232(oneCmd string) error {
 	oneCmd = strings.TrimSpace(oneCmd)
 	if oneCmd == "" {
@@ -451,7 +558,7 @@ func updateFILESFromRS232(oneCmd string) error {
 		oneCmd += ";"
 	}
 
-	content, err := os.ReadFile(filesPath)
+	content, err := os.ReadFile(getFilesPath())
 	if err != nil {
 		return fmt.Errorf("failed to read FILES: %w", err)
 	}
@@ -463,7 +570,6 @@ func updateFILESFromRS232(oneCmd string) error {
 		return fmt.Errorf("invalid command: %q", oneCmd)
 	}
 	cmdKey := toks[0]
-
 	replaced := false
 
 	for i, line := range lines {
@@ -471,8 +577,6 @@ func updateFILESFromRS232(oneCmd string) error {
 		if lt == "" {
 			continue
 		}
-
-		// Axis: match by letter only
 		if isAxisKey(cmdKey) {
 			if strings.HasPrefix(lt, string(cmdKey[0])) {
 				lines[i] = oneCmd
@@ -481,8 +585,6 @@ func updateFILESFromRS232(oneCmd string) error {
 			}
 			continue
 		}
-
-		// Special modal: G90/G91 replace each other
 		if cmdKey == "G90" || cmdKey == "G91" {
 			if strings.HasPrefix(lt, "G90") || strings.HasPrefix(lt, "G91") {
 				lines[i] = oneCmd
@@ -491,8 +593,6 @@ func updateFILESFromRS232(oneCmd string) error {
 			}
 			continue
 		}
-
-		// Normal: exact token match
 		if strings.HasPrefix(lt, cmdKey) {
 			lines[i] = oneCmd
 			replaced = true
@@ -500,25 +600,10 @@ func updateFILESFromRS232(oneCmd string) error {
 		}
 	}
 
-	// Not found: insert before M99/M30
 	if !replaced {
 		idx := findInsertBeforeEnd(lines)
 		lines = append(lines[:idx], append([]string{oneCmd}, lines[idx:]...)...)
 	}
 
-	// Atomic write via temp file
-	tmpPath := filesPath + ".tmp"
-	data := strings.Join(lines, "\n")
-	if !strings.HasSuffix(data, "\n") {
-		data += "\n"
-	}
-
-	if err := os.WriteFile(tmpPath, []byte(data), 0644); err != nil {
-		return fmt.Errorf("failed to write temp FILES: %w", err)
-	}
-	if err := os.Rename(tmpPath, filesPath); err != nil {
-		return fmt.Errorf("failed to replace FILES: %w", err)
-	}
-
-	return nil
+	return writeFILESAtomic(lines)
 }
