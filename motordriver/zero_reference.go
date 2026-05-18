@@ -19,9 +19,16 @@ import (
 //     comparison must be in the same raw sign space.
 //   - Saving getRawApos() instead would cause an infinite flip loop:
 //     next boot sees opposite signs → flips → display=0 but shaft is wrong.
+//
+// BUG FIX: live position is now read directly from the encoder via
+// getRawApos() + currentPosition() rather than from the cached
+// driverStatus.currentPosition. The cache defaults to 0 at boot and is
+// only populated after the first poll tick (~50ms). If zero-ref is
+// triggered before that tick, getPos(0, 0, ...) returns 0 and the
+// motor never moves. Reading live from the encoder is always correct
+// regardless of timing.
 func moveToZero(device MasterDevice) error {
 	logger.Debug("move to zero started")
-	driverStatus := getCurrentDriverStatus(device.Device.Name)
 	driverSettings := settings.GetDriverSettings(device.Device.Name)
 	_ = driverSettings
 
@@ -30,9 +37,15 @@ func moveToZero(device MasterDevice) error {
 	notifier.NotifyDestinationPosition(device.Name, float32(targetPosition))
 	notifyDriverStatus("destination_position", fmt.Sprintf("%f", targetPosition), device)
 
-	// Shortest path to zero.
-	cwPosition  := getPos(driverStatus.currentPosition, 0, true)
-	ccwPosition := getPos(driverStatus.currentPosition, 0, false)
+	// Read live position directly from encoder — do NOT use the cached
+	// driverStatus.currentPosition which may be stale (zero) at boot.
+	rawPos := getRawApos()
+	livePos, _ := currentPosition(rawPos, device.Device.DriveXRatio, device.Device.Name)
+	logger.Info("moveToZero: live position from encoder:", livePos, "° for driver:", device.Device.Name)
+
+	// Shortest path to zero using the live encoder position.
+	cwPosition  := getPos(livePos, 0, true)
+	ccwPosition := getPos(livePos, 0, false)
 
 	position := ccwPosition
 	if math.Abs(cwPosition) < math.Abs(ccwPosition) {

@@ -179,6 +179,16 @@ func readLastLine() (int, error) {
 func resolveStartLine(currentFile string) int {
 	currentName := filepath.Base(currentFile)
 
+	// RS232 mode: always start from line 0.
+	// The FILES program is always a fresh 5-line instruction rebuilt by the
+	// RS232 handler. Resuming mid-program causes G68/mode commands to replay
+	// on top of the live M99 loop, producing double-execution of setup lines.
+	// Standard UI execution is unaffected — IsRS232Enabled is false there.
+	if IsRS232Enabled() {
+		clearLastLine()
+		return 0
+	}
+
 	// Priority 1: explicit user line selection from UI (one-shot).
 	userLine, err := settings.LoadLineNumberAsInt()
 	if err == nil && userLine > 0 {
@@ -570,6 +580,12 @@ func executeInLineParamFunction(funcToExec h.Handler, cmd dt.Command, execContex
 }
 
 func waitForProgramFileUpdate(filePath string) {
+	// 60s timeout: if the CNC goes silent (cable fault, program end, operator
+	// stop), the executor exits cleanly instead of hanging forever in the
+	// M99 wait loop. Standard (non-RS232) execution never calls this function
+	// — it uses WaitExecuteNextCommand() instead. Safe to set StopExecution
+	// here because we are inside the IsRS232Enabled() branch of executeCommands.
+	const timeout = 60 * time.Second
 	info, err := os.Stat(filePath)
 	if err != nil {
 		logger.Warn("Could not stat file for updates:", err)
@@ -577,8 +593,9 @@ func waitForProgramFileUpdate(filePath string) {
 	}
 
 	lastMod := info.ModTime()
+	deadline := time.Now().Add(timeout)
 
-	for {
+	for time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 
 		info, err := os.Stat(filePath)
@@ -589,9 +606,12 @@ func waitForProgramFileUpdate(filePath string) {
 
 		if info.ModTime().After(lastMod) {
 			logger.Info("Detected program file update:", filePath)
-			break
+			return
 		}
 	}
+
+	logger.Warn("[RS232] waitForProgramFileUpdate: 60s timeout — CNC sent no new command, exiting wait")
+	execContext.StopExecution = true
 }
 
 func UpdateLastLineFromJSON() {
