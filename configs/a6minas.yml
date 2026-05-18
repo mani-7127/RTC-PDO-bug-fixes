@@ -255,11 +255,20 @@ ethercat:
       name: resetMultiTurn
       steps:
         - step:
+          name: "set status word"
+          address: 0x6040
+          subindex: 0x00
+          value: "0x7"
+          delay: 0
+          isBinary: false
+          dataType: "U16"
+          action: "write"
+        - step:
           name: "special function setting 9"
           address: 0x4D01
           subindex: 0x00
           value: "0x31"
-          delay: 0
+          delay: 200000
           isBinary: false
           dataType: "U16"
           action: "write"

@@ -118,6 +118,12 @@ func socketEventsCreator(server *gosocketio.Server) {
 
 	server.On("reset", func(c *gosocketio.Channel, msg channels.SocketMessage) {
 		logger.Debug("Reset initiated")
+		// BUG FIX: Clear executionInProgress on reset.
+		// If a program was running when Reset was pressed, the flag stays true
+		// permanently — every subsequent Execute is rejected with "Program already
+		// running" until the app is restarted. Reset is a full system clear, so
+		// the execution lock must be released here so the next Execute works.
+		executionInProgress.Store(false)
 		channels.NotifyMotorDriver("RESET", "", "", 0)
 		channels.SendAlarm("No Alarms")
 	})
@@ -148,6 +154,11 @@ func socketEventsCreator(server *gosocketio.Server) {
 
 	server.On("emergency", func(c *gosocketio.Channel, msg channels.SocketMessage) {
 		logger.Debug("emergency activated")
+		// BUG FIX: Also clear executionInProgress on emergency stop.
+		// Emergency stops the program abruptly — the defer in executeProgram
+		// may not fire if the goroutine is blocked on ECS or a channel wait,
+		// leaving the flag stuck as true after emergency.
+		executionInProgress.Store(false)
 		channels.NotifyMotorDriver("EMERGENCY", "", "", 0)
 		channels.WriteCommandExecInput("stop_prog_exec", "")
 	})

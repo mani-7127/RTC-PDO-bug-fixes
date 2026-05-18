@@ -111,12 +111,21 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 		}
 	}
 
+	// setDirection uses notifyDriverStatusWithWait — it blocks until the
+	// driver_status_keeper listener has updated backlash in the map.
+	// We must re-read status AFTER this call to get the correct backlash value
+	// (either backlashInSetting for CCW, or 0 for CW).
+	// Reading from driverStatusAfterECS here would use a stale snapshot and
+	// backlash compensation would never apply correctly on direction changes.
 	setDirection(device, driverStatusAfterECS, moveToPos)
 	notifyDriverStatus("destination_position", fmt.Sprintf("%f", destination), device)
 
-	backlash := driverStatusAfterECS.backlash
+	driverStatusAfterDirection := getCurrentDriverStatus(device.Device.Name) // fresh read — backlash now updated by setDirection
+	backlash := driverStatusAfterDirection.backlash
 	pitchErr := getPitchError(device.Name, destination)
 	moveToWithComp := moveToPos + pitchErr - backlash
+
+	logger.Info("compensation: moveToPos=", moveToPos, "pitchErr=", pitchErr, "backlash=", backlash, "moveToWithComp=", moveToWithComp)
 
 	// Execute the physical move.
 	// doRotate internally: declamp → move → wait bit10 → clamp
