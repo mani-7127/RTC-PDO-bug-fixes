@@ -1,10 +1,10 @@
 package motordriver
 
 import (
-	channels "EtherCAT/channels"
-	logger   "EtherCAT/logger"
+	"EtherCAT/channels"
+	"EtherCAT/logger"
 	notifier "EtherCAT/motordriver/statusnotifier"
-	settings "EtherCAT/settings"
+	"EtherCAT/settings"
 	"fmt"
 	"math"
 	"time"
@@ -12,13 +12,23 @@ import (
 
 // moveToZero moves the motor to the customer-defined physical zero.
 //
-// Rules:
-//   - HomingOffset is the customer's mechanical calibration — NEVER touched here.
-//   - HomingApos is saved as the RAW pdoFbActual value (not getRawApos).
-//     InitAposCorrection also reads raw pdoFbActual, so both sides of the
-//     comparison must be in the same raw sign space.
-//   - Saving getRawApos() instead would cause an infinite flip loop:
-//     next boot sees opposite signs → flips → display=0 but shaft is wrong.
+// The overall logic (shortest-path calculation, freeRotate, notifications)
+// is preserved exactly from the original uploaded version.
+//
+// PDO-specific additions:
+//   - After freeRotate, waits for motor to physically settle using PDO apos.
+//   - Saves HomingApos as a NORMALIZED NEGATIVE value so InitAposCorrection
+//     works correctly on every subsequent boot regardless of sign-flip state.
+//   - sendECSFinSignal uses PDO 60FE atomics.
+//   - configureDriver call removed — was redundant; original uploaded version
+//     had it before freeRotate but it is already called during InitMaster.
+//
+// WHY normalize HomingApos to negative:
+//   If zero-ref is done on a "flipped" boot (pdoFbActual positive), saving
+//   raw pdoFbActual would give a positive HomingApos. On the next normal boot
+//   (pdoFbActual negative), InitAposCorrection sees opposite signs and wrongly
+//   applies correction — display shows ~3° instead of 0.000°. By always saving
+//   negative, both sides of the comparison are always in the same space.
 func moveToZero(device MasterDevice) error {
 	logger.Debug("move to zero started")
 	driverStatus := getCurrentDriverStatus(device.Device.Name)
@@ -30,38 +40,31 @@ func moveToZero(device MasterDevice) error {
 	notifier.NotifyDestinationPosition(device.Name, float32(targetPosition))
 	notifyDriverStatus("destination_position", fmt.Sprintf("%f", targetPosition), device)
 
-	// Shortest path to zero.
-	cwPosition  := getPos(driverStatus.currentPosition, 0, true)
-	ccwPosition := getPos(driverStatus.currentPosition, 0, false)
-
-	position := ccwPosition
+	// Shortest-path calculation — identical to original uploaded version.
+	position := 0.00
+	var cwPosition  = getPos(driverStatus.currentPosition, 0, true)
+	var ccwPosition = getPos(driverStatus.currentPosition, 0, false)
 	if math.Abs(cwPosition) < math.Abs(ccwPosition) {
 		position = cwPosition
+	} else {
+		position = ccwPosition
 	}
-
 	logger.Debug("Position Values:", cwPosition, ccwPosition)
-	logger.Debug("zero ref position:", position)
+	logger.Debug("zero ref position: ", position)
 
+	// freeRotate is unchanged — it calls doRotate (PDO PP mode) internally.
 	freeRotate(device, position)
 
-	// Wait for physical standstill.
-	// Save HomingApos as a NORMALIZED negative value regardless of
-	// what signFlipActive is at this moment.
-	//
-	// WHY: if zero-ref is done on a flipped boot, pdoFbActual is positive
-	// (+520984704). On the next normal boot pdoFbActual is negative
-	// (-520984704). InitAposCorrection sees opposite signs and wrongly
-	// applies correction — display shows 3.174° instead of 0.000°.
-	//
-	// By always saving HomingApos as negative (abs value negated), both
-	// sides of the InitAposCorrection comparison are always in the same
-	// space: bootApos negative (no flip) matches, bootApos positive (flip)
-	// gets corrected to negative — either way currentPosition() sees the
-	// same value every single boot.
+	// Wait for the physical shaft to settle before capturing HomingApos.
+	// Without this, the encoder value captured immediately after bit10 fires
+	// may still be oscillating by 1-2 pulses as deceleration completes.
 	rawAtZero := waitForMotorSettle(10*time.Second, 50*time.Millisecond, 3)
+
+	// Normalize HomingApos to negative regardless of current sign-flip state.
+	// See header comment for the reason.
 	var aposAtZero int32
 	if rawAtZero > 0 {
-		aposAtZero = -rawAtZero // normalize to negative
+		aposAtZero = -rawAtZero
 	} else {
 		aposAtZero = rawAtZero
 	}
@@ -83,10 +86,11 @@ func moveToZero(device MasterDevice) error {
 
 // waitForMotorSettle polls raw pdoFbActual until stable for stableCount
 // consecutive reads spaced interval apart, or until timeout elapses.
-// Returns the RAW encoder value.
+// Returns the RAW encoder value (before sign-flip correction) so it can be
+// saved directly as HomingApos in the same space as InitAposCorrection reads it.
 func waitForMotorSettle(timeout, interval time.Duration, stableCount int) int32 {
 	deadline := time.Now().Add(timeout)
-	prev  := pdoFbActual.Load()
+	prev   := pdoFbActual.Load()
 	streak := 1
 
 	for time.Now().Before(deadline) {
@@ -107,11 +111,16 @@ func waitForMotorSettle(timeout, interval time.Duration, stableCount int) int32 
 	return prev
 }
 
+// getPos calculates the angular distance to move to reach targetPos from
+// currentPos in the specified direction. Unchanged from original uploaded version.
 func getPos(currentPos float64, targetPos float64, clockwise bool) float64 {
 	currentPos = math.Mod(currentPos, 360)
 	modeDiff   := math.Mod((currentPos - targetPos), 360)
+
 	if clockwise {
-		return math.Mod((360 - modeDiff), 360)
+		tomove := math.Mod(360-modeDiff, 360)
+		return tomove
 	}
-	return math.Mod((modeDiff * -1), 360)
+
+	return math.Mod(modeDiff*-1, 360)
 }

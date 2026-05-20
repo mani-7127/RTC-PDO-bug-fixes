@@ -8,18 +8,23 @@ import (
 // PowerOn drives the CiA402 state machine to Operation Enabled via PDO.
 // Replaces SDO sequence: write 6040=0x0006, write 6040=0x0007.
 // With PDO running, the cyclic state machine handles 6040 automatically
-// once pdoEnableRequested=true. We just need to ensure mode is set.
+// once pdoEnableRequested=true. We just seed target to current position
+// so the drive does not jump on enable.
+//
+// Function signature and behaviour are unchanged from the original —
+// callers such as InitMaster, setupDrivers, and PowerOnMasters still work.
 func PowerOn(masterDevice MasterDevice) error {
 	logger.Trace("poweron driver: ", masterDevice.Name)
-	// Seed target to current position so drive does not jump on enable
 	pdoCmdTarget.Store(pdoFbActual.Load())
 	pdoCmdMode.Store(cia402ModeProfilePosition)
 	pdoEnableRequested.Store(true)
 	return nil
 }
 
-// FastPowerOn is the same as PowerOn — PDO state machine handles 6040.
-// Replaces SDO: write 6040 = 0x000F (binary 0000000000001111).
+// FastPowerOn is the same as PowerOn — the PDO state machine handles 6040.
+// Replaces SDO: write 6040 = 0x000F.
+// All code that previously called FastPowerOn (doRotate, ManualJog, etc.)
+// continues to work without changes.
 func FastPowerOn(masterDevice MasterDevice) error {
 	logger.Trace("fast poweron driver: ", masterDevice.Name)
 	pdoCmdTarget.Store(pdoFbActual.Load())
@@ -40,6 +45,8 @@ func PowerOffAll(masterDevices []MasterDevice) error {
 	return nil
 }
 
+// powerOff cached operation — kept for interface compatibility,
+// not used in PDO mode.
 var powerOff = ethercatdevicedatatypes.Operation{}
 
 // PowerOff commands the drive to Shutdown state via PDO.
@@ -65,13 +72,10 @@ func FastPowerOff(masterDevice MasterDevice) error {
 	return nil
 }
 
-// emergency triggers a quick-stop via PDO by clearing bit2 of the controlword.
-// The old SDO emergency was commented out in the YAML so this is a safe default.
+// emergency triggers a quick-stop via PDO by zeroing velocity and dropping enable.
+// The old SDO emergency was commented out in the YAML so this is the correct path.
 func emergency(masterDevice MasterDevice) error {
 	logger.Trace("emergency activated ", masterDevice.Name)
-	// Quick-stop: clear bit2 of controlword (0x000F -> 0x000B)
-	// The cyclic loop checks pdoStopRequest which does the same thing,
-	// but for emergency we also disable immediately.
 	pdoCmdVelocity.Store(0)
 	pdoEnableRequested.Store(false)
 	return nil

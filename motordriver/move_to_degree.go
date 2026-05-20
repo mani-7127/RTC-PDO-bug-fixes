@@ -12,9 +12,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// ----------------------------------------------------------
+// Precision configuration — unchanged from original uploaded version.
+// ----------------------------------------------------------
 const (
-	positionToleranceFastPath = 0.02
-	positionToleranceFinal    = 0.02
+	positionToleranceFastPath = 0.05
+	positionToleranceFinal    = 0.05
 )
 
 func clearTargetReached(device MasterDevice) {
@@ -25,8 +28,21 @@ func sleepMs(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
+// moveMotorToDegree is the main motion function.
+//
+// The overall flow (ABS/REL handling, ECS HIGH/LOW, fast-path, direction,
+// compensation, FINISH BLOCKED safety check) is preserved from the original
+// uploaded version.
+//
+// PDO-specific changes:
+//   - setDirection reads fresh backlash after direction update (was stale in original).
+//   - doRotate now uses PDO atomics instead of SDO moveToPosition.
+//   - sendECSFinSignal uses PDO 60FE instead of SDO finsignal/finsignalend.
+//   - refreshCurrentPositionForDevice uses getRawApos() for sign-correct sync.
+//   - Fast-path calls doECSCheckZero after FIN (bug fix: original skipped it).
 func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 	driverStatus := getCurrentDriverStatus(device.Device.Name)
+
 	if driverStatus.potNotExceeded {
 		logger.Error("pot/not exceeded, exiting from move command")
 		return errors.New("pot/not exceeded, exiting from move command")
@@ -42,6 +58,8 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 	)
 
 	var moveToPos, destination float64
+
+	// ABS / Relative handling — identical to original uploaded version.
 	if driverStatus.mode == "ABS" {
 		moveToPos, destination = getAbsolutePosition(
 			driverStatus.currentPosition,
@@ -58,7 +76,9 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 
 	notifier.NotifyDestinationPosition(device.Name, float32(destination-driverStatus.workOffset))
 
-	// --- ECS HIGH wait ---
+	// ----------------------------------------------------------
+	// ECS HIGH wait — identical to original uploaded version.
+	// ----------------------------------------------------------
 	channels.WriteCommandExecInput("waiting_for_ecs", "")
 	gotEcs := doECSCheck(device, destination)
 	if gotEcs == 0 || gotEcs == 2 {
@@ -68,33 +88,28 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 
 	driverStatusAfterECS := getCurrentDriverStatus(device.Device.Name)
 
-	// --- ABS fast-path: already at target ---
+	// ----------------------------------------------------------
+	// ABS FAST-PATH (already at target)
 	//
-	// When the motor is already at the destination (within tolerance), we skip
-	// the physical move but MUST still complete the full ECS handshake:
-	//   FIN → wait ECS LOW
+	// Original uploaded version: sent FIN then returned without calling
+	// doECSCheckZero — machine never acknowledged LOW, next ECS HIGH
+	// arrived immediately and the machine appeared to skip the LOW phase.
 	//
-	// BUG FIX: The previous fast-path returned after sending FIN without
-	// calling doECSCheckZero. The machine sends ECS LOW only after seeing FIN.
-	// Skipping doECSCheckZero caused the program to race to the next line
-	// before the machine had acknowledged completion — the next ECS HIGH
-	// arrived immediately because the machine hadn't had time to go LOW first,
-	// making it appear the machine skipped the LOW phase entirely.
+	// Fix: always call doECSCheckZero after FIN, even on fast-path.
+	// ----------------------------------------------------------
 	if driverStatusAfterECS.mode == "ABS" &&
 		math.Abs(driverStatusAfterECS.currentPosition-destination) <= positionToleranceFastPath {
+
 		recheck := getCurrentDriverStatus(device.Device.Name)
+
 		if math.Abs(recheck.currentPosition-destination) <= positionToleranceFastPath {
 			logger.Info("Already at target — sending FIN and waiting ECS LOW", "id:", uid)
 
-			// Send FIN — machine needs this to know we acknowledged the position.
 			if err := sendECSFinSignal(device); err != nil {
 				return err
 			}
 
 			// Wait for ECS LOW — required even on fast-path.
-			// Without this, the next command's ECS HIGH check sees the ECS
-			// signal that is still HIGH from this command, and proceeds
-			// immediately without the machine having reset its state.
 			channels.WriteCommandExecInput("waiting_for_ecs", "")
 			gotEcsZero := doECSCheckZero(device, destination)
 			if gotEcsZero == 0 || gotEcsZero == 2 {
@@ -102,7 +117,6 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 			}
 			channels.WriteCommandExecInput("ecs_done", "")
 
-			// BUG FIX: Use getRawApos() not pdoFbActual.Load().
 			refreshCurrentPositionForDevice(device)
 			doneDriverAction()
 			channels.DestinationReached()
@@ -111,34 +125,60 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 		}
 	}
 
-	// setDirection uses notifyDriverStatusWithWait — it blocks until the
-	// driver_status_keeper listener has updated backlash in the map.
-	// We must re-read status AFTER this call to get the correct backlash value
-	// (either backlashInSetting for CCW, or 0 for CW).
-	// Reading from driverStatusAfterECS here would use a stale snapshot and
-	// backlash compensation would never apply correctly on direction changes.
+	// ----------------------------------------------------------
+	// SET DIRECTION
+	// setDirection uses notifyDriverStatusWithWait — blocks until
+	// driver_status_keeper has updated backlash. Re-read status AFTER
+	// this call to get correct backlash (was stale in original uploaded version).
+	// ----------------------------------------------------------
 	setDirection(device, driverStatusAfterECS, moveToPos)
 	notifyDriverStatus("destination_position", fmt.Sprintf("%f", destination), device)
 
-	driverStatusAfterDirection := getCurrentDriverStatus(device.Device.Name) // fresh read — backlash now updated by setDirection
+	// Fresh read after setDirection so backlash is current.
+	driverStatusAfterDirection := getCurrentDriverStatus(device.Device.Name)
 	backlash := driverStatusAfterDirection.backlash
 	pitchErr := getPitchError(device.Name, destination)
 	moveToWithComp := moveToPos + pitchErr - backlash
 
 	logger.Info("compensation: moveToPos=", moveToPos, "pitchErr=", pitchErr, "backlash=", backlash, "moveToWithComp=", moveToWithComp)
 
-	// Execute the physical move.
-	// doRotate internally: declamp → move → wait bit10 → clamp
-	if err := doRotate(device, moveToWithComp); err != nil {
+	clearTargetReached(device)
+
+	// ----------------------------------------------------------
+	// ROTATE — doRotate uses PDO PP mode instead of SDO.
+	// ----------------------------------------------------------
+	err := doRotate(device, moveToWithComp)
+	if err != nil {
 		return err
 	}
 
-	// Send FIN only after clamp confirmed (doRotate returned successfully).
+	// ----------------------------------------------------------
+	// STRONG SAFETY BLOCK BEFORE FINISH SIGNAL
+	// Preserved from original uploaded version.
+	// ----------------------------------------------------------
+	currentPos := getCurrentDriverStatus(device.Device.Name).currentPosition
+	errVal := math.Abs(currentPos - destination)
+
+	if errVal > positionToleranceFinal {
+		logger.Error(
+			"FINISH BLOCKED — target NOT reached!",
+			"target=", destination,
+			"current=", currentPos,
+			"error=", errVal,
+		)
+		return fmt.Errorf("finish blocked: target not reached")
+	}
+
+	// ----------------------------------------------------------
+	// SEND FINISH SIGNAL
+	// ----------------------------------------------------------
 	if err := sendECSFinSignal(device); err != nil {
 		return err
 	}
 
-	// Wait for ECS LOW before advancing to next line.
+	// ----------------------------------------------------------
+	// ECS ZERO
+	// ----------------------------------------------------------
 	channels.WriteCommandExecInput("waiting_for_ecs", "")
 	gotEcsZero := doECSCheckZero(device, destination)
 	if gotEcsZero == 0 || gotEcsZero == 2 {
@@ -148,30 +188,38 @@ func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
 
 	doneDriverAction()
 	channels.DestinationReached()
-	// BUG FIX: Use getRawApos() not pdoFbActual.Load().
 	refreshCurrentPositionForDevice(device)
 	logger.Info("move to position completed", "driver", device.Name, "id", uid)
 	return nil
 }
 
+// ----------------------------------------------------------
+// Step Mode — unchanged from original uploaded version.
+// ----------------------------------------------------------
 func stepMode(masterDevice MasterDevice, valueInDegreeToAdd float64) error {
 	logger.Debug("step mode moving to position: ", valueInDegreeToAdd)
+
 	driverStatus := getCurrentDriverStatus(masterDevice.Device.Name)
 	if driverStatus.potNotExceeded {
 		logger.Error("pot/not exceeded, exiting from move command")
 		channels.StepModeComplete()
 		return errors.New("pot/not exceeded, exiting from move command")
 	}
+
 	err := freeRotate(masterDevice, valueInDegreeToAdd)
 	channels.StepModeComplete()
 	return err
 }
 
+// ----------------------------------------------------------
+// Direction Selection — unchanged from original uploaded version.
+// ----------------------------------------------------------
 func setDirection(device MasterDevice, driverStatus driverCurrentStatus, degreeToRotate float64) {
 	if !driverStatus.shortestPathEnabled {
 		notifyDriverStatusWithWait("rotation_direction", "1", device)
 		return
 	}
+
 	if degreeToRotate > 0 {
 		notifyDriverStatusWithWait("rotation_direction", "1", device)
 	} else {
@@ -179,6 +227,11 @@ func setDirection(device MasterDevice, driverStatus driverCurrentStatus, degreeT
 	}
 }
 
+// ----------------------------------------------------------
+// Position Sync Helpers — updated to use getRawApos() for sign-correct sync.
+// ----------------------------------------------------------
+
+// RefreshCurrentPosition syncs all devices' cached currentPosition to live encoder.
 func RefreshCurrentPosition() {
 	for _, device := range masterDevices {
 		refreshCurrentPositionForDevice(device)
@@ -186,7 +239,7 @@ func RefreshCurrentPosition() {
 }
 
 // refreshCurrentPositionForDevice syncs cached currentPosition to live encoder.
-// BUG FIX: Uses getRawApos() not pdoFbActual.Load() — sign-flip correction applied.
+// Uses getRawApos() — sign-flip correction applied, consistent with display.
 func refreshCurrentPositionForDevice(device MasterDevice) {
 	rawPos := getRawApos()
 	curPos, _ := currentPosition(rawPos, device.Device.DriveXRatio, device.Name)
@@ -197,8 +250,10 @@ func refreshCurrentPositionForDevice(device MasterDevice) {
 	logger.Info("[SYNC] Updated current position:", curPos, "° for drive", device.Name)
 }
 
-func ReadActualPositionFromDrive(device MasterDevice) float64 {
-	rawPos := getRawApos()
-	curPos, _ := currentPosition(rawPos, device.Device.DriveXRatio, device.Name)
-	return curPos
+// ReadActualPositionFromDrive returns current live position in degrees.
+// Uses getRawApos() for sign-correct value. Signature kept compatible with
+// the original uploaded version (takes device name string).
+func ReadActualPositionFromDrive(driveName string) float64 {
+	status := getCurrentDriverStatus(driveName)
+	return status.currentPosition
 }

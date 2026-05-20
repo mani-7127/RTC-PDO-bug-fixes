@@ -83,11 +83,6 @@ func InitAposCorrection(driveName string) {
 		return
 	}
 
-	// Sign-only check. HomingApos is always saved as negative (zero_reference.go
-	// normalizes it). bootApos positive = sign flip occurred. No magnitude gate —
-	// the table may have physically moved between power cycles AND the sign may
-	// have flipped simultaneously. The old 15% magnitude gate blocked the
-	// correction in exactly that case (operator parks table at any position).
 	ratioDiff := math.Abs((bootMag/homeMag) - 1.0)
 	logger.Info("InitAposCorrection: checking sign",
 		"drive=", driveName,
@@ -113,32 +108,28 @@ func InitAposCorrection(driveName string) {
 	}
 }
 
-// getPulsesFromDegree returns the pulse count to send to the drive.
+// getPulsesFromDegree returns the value to send to driver based on the degree
+// passed by the client. Pulse calculation and DriveXRatio logic is unchanged
+// from the original uploaded version.
 func getPulsesFromDegree(masterDevice MasterDevice, degree float64) int64 {
 	pulse := float64(masterDevice.Device.DriveXRatio) * degree
 	pulseForDisp := fmt.Sprintf("%f", pulse)
-	logger.Debug("degree:", degree, "pulse:", pulseForDisp,
-		"integer:", int32(pulse), "driveXRatio:", masterDevice.Device.DriveXRatio)
+	logger.Debug("degree: ", degree, " pulse: ", pulseForDisp, " integer: ", int32(pulse), "drive x ratio:", masterDevice.Device.DriveXRatio)
 	return int64(pulse)
 }
 
 // currentPosition converts encoder pulses → degrees [0, 360).
 // pos must come from getRawApos() — sign-flip correction is applied there.
 //
-// After our sign-flip architecture change, getRawApos() ALWAYS returns a
-// value in the NEGATIVE coordinate space when the table is near zero
-// (e.g. -554431729). This is consistent across all boots.
-//
-// However, the customer's HomingOffset (e.g. 1.587°) was originally set
-// when the old code returned POSITIVE values for the same position. So the
-// stored HomingOffset has the opposite sign for our new coordinate space.
-// We negate it here to compensate. The customer never needs to change their
-// HomingOffset setting.
+// After the sign-flip architecture, getRawApos() ALWAYS returns a value in
+// the NEGATIVE coordinate space when near zero. The customer's HomingOffset
+// was originally calibrated when pos was POSITIVE, so we negate it here.
+// The customer never needs to change their HomingOffset setting.
 func currentPosition(pos int32, driveXRatio int, driveName string) (float64, float64) {
 	driverSettings := settings.GetDriverSettings(driveName)
 
-	// Negate HomingOffset because getRawApos() now returns normalized
-	// negative values, but the customer calibrated when pos was positive.
+	// Negate HomingOffset because getRawApos() returns normalized negative values
+	// but the customer calibrated when pos was positive.
 	homingOffset := -driverSettings.HomingOffset
 
 	driveOffset := homingOffset * float32(driveXRatio)
@@ -147,26 +138,38 @@ func currentPosition(pos int32, driveXRatio int, driveName string) (float64, flo
 
 	// Double mod guarantees [0, 360) for any sign/magnitude of input.
 	drivePosition = math.Mod(math.Mod(drivePosition, 360)+360, 360)
-	if drivePosition >= 359.999 {
-		drivePosition = 0
-	}
+drivePosition = math.Round(drivePosition*100) / 100  // snap to 0.01° resolution
+if drivePosition >= 359.99 {
+    drivePosition = 0
+}
 
 	drivePositionWithErrorCorrection := drivePosition
 	return helper.RoundFloat(drivePosition, 3),
 		helper.RoundFloat(drivePositionWithErrorCorrection, 3)
 }
 
+// getAbsolutePosition moves motor to absolute degree.
+// Returns move-to position for driver and destination position for UI display.
+// Based on getDestinationAngle() in machine_parser.js line# 420.
 func getAbsolutePosition(currentPos float64, targetPos float64, useShortestPath bool) (float64, float64) {
 	return helper.GetAbsolutePosition(currentPos, targetPos, useShortestPath)
 }
 
+// getRelativePosition returns the relative position based on current position.
+// For e.g. if current position is 10° and ordered 20° then motor moves to 30°.
+// Based on getDestinationAngle() in machine_parser.js line# 420.
 func getRelativePosition(currentPos float64, targetPos float64, prevDestinationAngle float64) (float64, float64) {
+	// If previous destination is too far from current, use current position instead.
 	if math.Abs(currentPos-prevDestinationAngle) > 1.0 {
 		prevDestinationAngle = currentPos
 	}
 	return helper.GetRelativePosition(currentPos, targetPos, prevDestinationAngle)
 }
 
+// getPitchError returns the configured pitch error for position calibration.
+// It compensates for mechanical error measured at 10° intervals (36 intervals
+// from 0° to 360°). User display always shows original command; error acts
+// only in backend calculations.
 func getPitchError(driveName string, targetPos float64) float64 {
 	index := int(math.Abs(targetPos / 10))
 	index = index - 1

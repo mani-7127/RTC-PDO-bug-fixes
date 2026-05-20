@@ -74,12 +74,15 @@ func initDriverStatusKeeperListener() {
 	driverStatusMap = cmap.New()
 
 	// driverStatusMap = make(map[string]driverCurrentStatus)
+	// Set directly — do NOT call getCurrentDriverStatus here.
+	// On cmap v0.0.0-20210501183033, calling Get/IsEmpty immediately after
+	// cmap.New() panics (index out of range [0]) because shards not yet ready.
 	for _, dev := range masterDevices {
-		settings := settings.GetDriverSettings(dev.Name)
-		driveStatus := getCurrentDriverStatus(dev.Name)
-		driveStatus.backlashInSetting = settings.BackLash
-		driveStatus.isMotorRunning = false
-		setCurrentDriverStatus(dev.Name, driveStatus)
+		ds := settings.GetDriverSettings(dev.Name)
+		setCurrentDriverStatus(dev.Name, driverCurrentStatus{
+			backlashInSetting: ds.BackLash,
+			isMotorRunning:    false,
+		})
 	}
 	startDriverStatusListener()
 }

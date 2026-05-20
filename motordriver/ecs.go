@@ -24,6 +24,7 @@ func stopECSCheck() {
 
 // -------------------------------------------------------------------
 // ECS "GO-HIGH" Phase — wait until ECS goes high (ready to move)
+// Logic unchanged from original uploaded version.
 // -------------------------------------------------------------------
 func doECSCheck(masterDevice MasterDevice, degree float64) int {
 	envSettings := settings.GetDriverSettings(masterDevice.Name)
@@ -44,20 +45,22 @@ func doECSCheck(masterDevice MasterDevice, degree float64) int {
 }
 
 // -------------------------------------------------------------------
-// ECS "GO-LOW" Phase — wait until ECS goes low again
+// ECS "GO-LOW" Phase — wait until ECS goes low again.
+// debugECSOperation call from original uploaded version preserved.
 // -------------------------------------------------------------------
 func doECSCheckZero(masterDevice MasterDevice, degree float64) int {
 	envSettings := settings.GetDriverSettings(masterDevice.Name)
 	if envSettings.ECS == 1 {
-		logger.Debug("driver", masterDevice.Name, "waiting for ECS LOW. rotate to", degree)
+		logger.Debug("driver", masterDevice.Name, "waiting for ECS LOW (zero). rotate to", degree)
+		debugECSOperation(masterDevice)
 		ecsRec, _ := waitForECSZero(masterDevice)
 		if ecsRec == 1 {
-			logger.Debug("driver", masterDevice.Name, "ECS went LOW")
+			logger.Debug("driver", masterDevice.Name, "ECS went LOW (zero phase done)")
 		} else if ecsRec == 0 {
 			logger.Error("driver", masterDevice.Name, "ECS zero NOT received")
 			channels.SendAlarm("ECS did not go LOW")
 		} else {
-			logger.Info("exiting ECS zero check due to stop/reset event")
+			logger.Info("exiting ECS zero check as program stop/reset event received")
 		}
 		return ecsRec
 	}
@@ -65,11 +68,11 @@ func doECSCheckZero(masterDevice MasterDevice, degree float64) int {
 }
 
 // -------------------------------------------------------------------
-// Wait for ECS HIGH — delegates to driver.receivedECS (PDO-based)
+// Wait for ECS HIGH — delegates to driver.receivedECS (PDO-based).
+// operation is passed for interface compatibility only —
+// receivedECS reads from GetDigitalInputs4F25() PDO atomic, not SDO.
 // -------------------------------------------------------------------
 func waitForECS(masterDevice MasterDevice) (int, error) {
-	// operation is passed for interface compatibility only —
-	// receivedECS reads from GetDigitalInputs4F25() PDO atomic, not SDO.
 	operation, err := GetEtherCATOperation("ecs", masterDevice.Device.AddressConfigName)
 	if err != nil {
 		return 0, err
@@ -84,6 +87,10 @@ func waitForECS(masterDevice MasterDevice) (int, error) {
 // -------------------------------------------------------------------
 // Read ECS bit from PDO atomic — no SDO, no YAML operation needed.
 // Returns 1 = high, 0 = low.
+//
+// Replaces the SDO-based readECSInput from the original uploaded version.
+// The original called SDOUpload2 which fails under fault conditions and
+// adds latency in tight ECS polling loops.
 // -------------------------------------------------------------------
 func readECSInput(_ MasterDevice) int {
 	const ecsBitMask = uint32(0x01) // bit 0 = ECS in 4F25
@@ -95,12 +102,14 @@ func readECSInput(_ MasterDevice) int {
 
 // -------------------------------------------------------------------
 // Wait for ECS LOW — polls PDO with debounce, no timeout.
+// Debounce logic (5 stable reads × 20ms) is identical to the original
+// uploaded version.
 // -------------------------------------------------------------------
 func waitForECSZero(masterDevice MasterDevice) (int, error) {
 	isECSCheckInProgress = true
 	defer func() { isECSCheckInProgress = false }()
 
-	logger.Info("Waiting for ECS to go LOW...")
+	logger.Info("Waiting indefinitely for ECS to go LOW...")
 
 	for {
 		if readECSInput(masterDevice) == 0 {
@@ -114,7 +123,7 @@ func waitForECSZero(masterDevice MasterDevice) (int, error) {
 				}
 			}
 			if stable {
-				logger.Info("ECS signal stable LOW — continuing")
+				logger.Info("ECS signal is LOW – continuing execution")
 				return 1, nil
 			}
 		}
@@ -131,12 +140,16 @@ func waitForECSZero(masterDevice MasterDevice) (int, error) {
 }
 
 // -------------------------------------------------------------------
-// Send finish signal via PDO (60FE:01 and 60FE:02).
-// Value 65536 = 1<<16, same bit written via SDO before.
+// sendECSFinSignal sends the finish signal via PDO (60FE:01 and 60FE:02).
 //
-// Waits for apos to fully settle before asserting 60FE.
-// Uses getRawApos() so the settle check uses the sign-corrected value —
-// consistent with everything else in the position pipeline.
+// Key changes from original uploaded version:
+//   - Uses pdoFinishSub1/pdoFinishSub2 atomics instead of SDO finsignal/finsignalend.
+//   - Waits for apos to fully settle before asserting 60FE (2s timeout,
+//     5 stable reads × 20ms each).
+//   - Uses getRawApos() for settle check — sign-corrected, consistent with
+//     everything else in the position pipeline.
+//
+// fin_signal notify and ECSFinTiming sleep are unchanged from original.
 // -------------------------------------------------------------------
 func sendECSFinSignal(device MasterDevice) error {
 	envSettings := settings.GetDriverSettings(device.Name)
@@ -175,7 +188,7 @@ func sendECSFinSignal(device MasterDevice) error {
 	notifyDriverStatusWithWait("fin_signal", "true", device)
 	logger.Trace("start sending ECS fin signal (PDO)", device.Name)
 
-	pdoFinishSub1.Store(65536)
+	pdoFinishSub1.Store(65536) // bit16 = 1<<16, same value as original SDO
 	pdoFinishSub2.Store(65536)
 
 	time.Sleep(time.Duration(envSettings.ECSFinTiming) * time.Millisecond)
@@ -187,4 +200,34 @@ func sendECSFinSignal(device MasterDevice) error {
 	logger.Trace("finish sending ECS fin signal (PDO)", device.Name)
 
 	return nil
+}
+
+// -------------------------------------------------------------------
+// debugECSOperation prints the ECS EtherCAT operation mapping details.
+// Preserved exactly from the original uploaded version.
+// -------------------------------------------------------------------
+func debugECSOperation(masterDevice MasterDevice) {
+	op, err := GetEtherCATOperation("ecs", masterDevice.Device.AddressConfigName)
+	if err != nil {
+		logger.Error("debugECSOperation: failed to get ECS operation:", err)
+		return
+	}
+
+	logger.Info("----- ECS Operation Mapping -----")
+	logger.Info("Device:", masterDevice.Device.Name)
+	logger.Info("Operation Name:", op.Name)
+	logger.Info("Number of Steps:", len(op.Steps))
+	for i, step := range op.Steps {
+		logger.Info(
+			"Step", i,
+			"| Action:", step.Action,
+			"| DataType:", step.DataType,
+			"| Value:", step.Value,
+		)
+		func() {
+			defer func() { _ = recover() }()
+			logger.Info("   (extra fields) Step struct:", step)
+		}()
+	}
+	logger.Info("--------------------------------")
 }

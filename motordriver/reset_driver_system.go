@@ -9,9 +9,9 @@ import (
 )
 
 // systemResetInProgress prevents the infinite reset storm.
-// When ioStatusListener fires performSysReset() rapidly, the channel
-// accept serialises them, but resetSystemWorker must finish before
-// accepting the next one. This flag lets us drain extras fast.
+// When ioStatusListener fires performSysReset() rapidly, the buffered channel
+// serialises them, but resetSystemWorker must finish before accepting the next.
+// This flag lets us drop extras fast without blocking.
 var systemResetInProgress atomic.Bool
 
 func listenSystemReset() {
@@ -32,7 +32,7 @@ func performSysReset(checkMotorRunning bool) {
 		}
 	}
 
-	// If a reset is already running, drop this request entirely.
+	// If a reset is already running, drop this request.
 	// The running reset will fix the problem — no need to queue another.
 	if systemResetInProgress.Load() {
 		logger.Info("System reset already in progress, dropping duplicate request")
@@ -54,7 +54,7 @@ func resetSystemWorker() {
 			continue
 		}
 
-		// Guard: mark reset in progress so performSysReset drops concurrent calls
+		// Guard: mark reset in progress so performSysReset drops concurrent calls.
 		if !systemResetInProgress.CompareAndSwap(false, true) {
 			logger.Info("Reset already in progress (guard), skipping")
 			continue
@@ -62,7 +62,8 @@ func resetSystemWorker() {
 
 		logger.Info("===== SYSTEM RESET STARTED =====")
 
-		// Stop background workers — PDO cyclic stays running the whole time.
+		// Stop background workers — PDO cyclic stays running the whole time
+		// so the drive never loses its keepalive frames during reset.
 		stopDriverPolling()
 		stopDriverActionListener()
 		stopDriveStatusListener()
@@ -74,10 +75,10 @@ func resetSystemWorker() {
 		channels.WriteCommandExecInput("reset", "")
 		channels.NotifyCmdComplete()
 
-		// PDO fault reset — mutex inside ResetDriver prevents concurrent races
+		// PDO fault reset — mutex inside ResetDriver prevents concurrent races.
 		ResetDriver(masterDevices)
 
-		// Drain any reset requests that piled up while we were resetting
+		// Drain any reset requests that piled up while we were resetting.
 		for {
 			select {
 			case <-channels.ResetDriverSystem:
@@ -90,7 +91,7 @@ func resetSystemWorker() {
 
 		time.Sleep(300 * time.Millisecond)
 
-		// Restart background workers
+		// Restart background workers.
 		pollDrivePosition(masterDevices)
 		pollDriveError(masterDevices)
 		pollIOStat(masterDevices)
@@ -105,6 +106,8 @@ func resetSystemWorker() {
 	}
 }
 
+// StopSystem stops all channel listeners and the motor driver cleanly.
+// Includes stopPdoCyclic() to gracefully release the EtherCAT master.
 func StopSystem() {
 	if !HasDriverConnected() {
 		return
@@ -118,6 +121,7 @@ func StopSystem() {
 	stopPollIOStat()
 	stopECSCheck()
 
+	// Stop PDO cyclic before releasing master — prevents watchdog fault on next boot.
 	stopPdoCyclic()
 	time.Sleep(20 * time.Millisecond)
 

@@ -12,7 +12,6 @@ func breakOn(masterDevice MasterDevice) error {
 	for _, step := range operation.Steps {
 		SDODownload(masterDevice.Master, masterDevice.Position, step)
 	}
-
 	return nil
 }
 
@@ -26,6 +25,5 @@ func breakOff(masterDevice MasterDevice) error {
 	for _, step := range operation.Steps {
 		SDODownload(masterDevice.Master, masterDevice.Position, step)
 	}
-
 	return nil
 }

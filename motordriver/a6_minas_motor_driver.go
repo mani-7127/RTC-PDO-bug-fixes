@@ -7,33 +7,32 @@ same functions in another file.
 **/
 import (
 	ethercatDevice "EtherCAT/ethercatdevicedatatypes"
-	helper "EtherCAT/helper"
-	logger "EtherCAT/logger"
+	helper          "EtherCAT/helper"
+	logger          "EtherCAT/logger"
 	"EtherCAT/motordriver/statusnotifier"
 	"errors"
-	"time"
 	"fmt"
+	"time"
 )
 
-//A6Minas implementation for Panasonic A6 Minas driver
+// A6Minas implementation for Panasonic A6 Minas driver
 type A6Minas struct{}
 
-//hasTargetReached A6 Minas driver specific  function
-//Needs specific requirement to check whether it reach the position and cannot write in generic way
+// hasTargetReached waits for CiA402 bit10 (target reached) via PDO status word.
+// No SDO or mutex needed — reads pdoFbStatus atomic directly.
 func (a6 A6Minas) hasTargetReached(masterDevice MasterDevice, action int, immediate int, operation ethercatDevice.Operation) error {
 	logger.Trace("A6Minas waiting for target reached via PDO stw")
-	// bit10 = target reached (CiA402) — read from PDO atomic, no SDO/mutex needed
 	for {
-			stw := uint16(pdoFbStatus.Load())
-			if (stw & 0x0400) != 0 {
-					logger.Trace("A6Minas target reached stw=0x", fmt.Sprintf("%04X", stw))
-					return nil
-			}
-			time.Sleep(5 * time.Millisecond)
+		stw := uint16(pdoFbStatus.Load())
+		if (stw & 0x0400) != 0 {
+			logger.Trace("A6Minas target reached stw=0x", fmt.Sprintf("%04X", stw))
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-//Not used
+// Not used
 func (a6 A6Minas) potNotEnabled(masterDevice MasterDevice) (bool, error) {
 	inputStatus, err := readInputSignal(masterDevice)
 	if err != nil {
@@ -47,63 +46,67 @@ func (a6 A6Minas) potNotEnabled(masterDevice MasterDevice) (bool, error) {
 	return false, nil
 }
 
-//readDeclampSignal reads the declamp status of the driver
+// readDeclampSignal polls the DCL bit (bit 7 of 4F25) until the table
+// confirms it has declamped, or the timeout expires.
+//
+// FIX: The old implementation had two conflicting exit conditions —
+// a loop counter (i < declampTiming) and an elapsed-ms check. With PDO
+// reads being ~0ms (atomic), the loop ran only 3ms total (3000 × 1µs)
+// instead of the intended 3000ms, causing false timeouts even when the
+// clamp had already released.
+//
+// New implementation: single deadline-based loop, polls every 10ms,
+// true timeout = declampTiming milliseconds from start.
 func (a6 A6Minas) readDeclampSignal(masterDevice MasterDevice, declampTiming int) (bool, error) {
-	logger.Debug("waiting for declamp status")
-	start := time.Now()
-	for i := 0; i < declampTiming; i++ {
-		inputStatus, err := readInputSignal(masterDevice)
-		if err != nil {
-			break
-		}
+	logger.Debug("waiting for declamp status, timeout:", declampTiming, "ms")
+	deadline := time.Now().Add(time.Duration(declampTiming) * time.Millisecond)
 
-		toBinary := helper.IntToBinary(inputStatus)
-		if toBinary[7] == '1' {
+	for time.Now().Before(deadline) {
+		// DCL = bit 7 of 4F25, active high — table has declamped
+		val := GetDigitalInputs4F25()
+		toBinary := helper.IntToBinary(int(val))
+		if len(toBinary) > 7 && toBinary[7] == '1' {
+			logger.Debug("declamp confirmed after", time.Duration(declampTiming)*time.Millisecond-time.Until(deadline))
 			return true, nil
 		}
-		elapsed := time.Since(start)
-		time.Sleep(time.Microsecond * 1)
-		if elapsed.Milliseconds() > int64(declampTiming) {
-			break
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
+
+	logger.Error("declamp timeout after", declampTiming, "ms — DCL signal never went high")
 	statusnotifier.DriverError(65379)
 	return false, errors.New("declamp failed")
 }
 
+// readClampSignal polls the CL bit (bit 6 of 4F25) until the table
+// confirms it has clamped, or the timeout expires.
+//
+// FIX: Same dual-exit bug as readDeclampSignal — see comment above.
+// New implementation: single deadline-based loop, polls every 10ms,
+// true timeout = clampTiming milliseconds from start.
 func (a6 A6Minas) readClampSignal(masterDevice MasterDevice, clampTiming int) (bool, error) {
-	logger.Debug("waiting for clamp status", clampTiming, "ms")
-	start := time.Now()
-	for i := 0; i < clampTiming; i++ {
-		inputStatus, err := readInputSignal(masterDevice)
-		if err != nil {
-			break
-		}
+	logger.Debug("waiting for clamp status, timeout:", clampTiming, "ms")
+	deadline := time.Now().Add(time.Duration(clampTiming) * time.Millisecond)
 
-		toBinary := helper.IntToBinary(inputStatus)
-		if toBinary[6] == '1' {
+	for time.Now().Before(deadline) {
+		// CL = bit 6 of 4F25, active high — table has clamped
+		val := GetDigitalInputs4F25()
+		toBinary := helper.IntToBinary(int(val))
+		if len(toBinary) > 6 && toBinary[6] == '1' {
+			logger.Debug("clamp confirmed after", time.Duration(clampTiming)*time.Millisecond-time.Until(deadline))
 			return true, nil
 		}
-		elapsed := time.Since(start)
-		time.Sleep(time.Microsecond * 1)
-		if elapsed.Milliseconds() > int64(clampTiming) {
-			break
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
+
+	logger.Error("clamp timeout after", clampTiming, "ms — CL signal never went high")
 	statusnotifier.DriverError(65378)
 	return false, errors.New("clamp failed")
 }
 
-//receivedECS check whether ECS received or not. As per the requirement ECS should be enabled for 2sec
-//if ECS is enabled for 2 sec then return ECS received else false.
-// Returns
-//   1: Received ECS
-//   0: Not received ECS
-//   2: Exit from ECS check
+// receivedECS polls the ECS bit (bit 0 of 4F25) until it goes high.
+// Returns 1=received, 0=not received, 2=stop requested.
 func (a6 A6Minas) receivedECS(masterDevice MasterDevice, operation ethercatDevice.Operation, stopECSChan chan bool) int {
-
 	const ecsMask = uint32(1 << 0) // bit 0 = ECS, active high
-
 	for {
 		select {
 		default:
@@ -119,9 +122,7 @@ func (a6 A6Minas) receivedECS(masterDevice MasterDevice, operation ethercatDevic
 }
 
 func (a6 A6Minas) receivedECSZero(masterDevice MasterDevice, operation ethercatDevice.Operation, stopECSChan chan bool) int {
-
 	const ecsMask = uint32(1 << 0)
-
 	for {
 		select {
 		default:
@@ -137,27 +138,6 @@ func (a6 A6Minas) receivedECSZero(masterDevice MasterDevice, operation ethercatD
 }
 
 func (a6 A6Minas) sendFinishSignal(masterDevice MasterDevice, operation ethercatDevice.Operation) error {
-	// var val int = 0
-	// for _, s := range operation.Steps {
-	// 	if s.Action == "read" {
-	// 		val, _ = SDOUpload2(masterDevice.Master, masterDevice.Position, s)
-	// 	} else {
-	// 		bin := helper.IntToBinary(val)
-	// 		tow := "00000000000000010000000000000000"
-	// 		if len(bin) > 16 {
-	// 			tow = bin[:16] + "1" + bin[16+1:]
-	// 			fmt.Println(tow)
-	// 		}
-	// 		if s.Value == "fin_signal_val" {
-	// 			s.Value = tow
-	// 			logger.Debug("8888888888888888888888888888888888888888888888888888")
-	// 			err := SDODownload(masterDevice.Master, masterDevice.Position, s)
-	// 			if err != nil {
-	// 				logger.Error(err)
-	// 			}
-	// 		}
-	// 	}
-	// }
 	return nil
 }
 
@@ -176,7 +156,6 @@ func (a6 A6Minas) stopPollIOStat() {
 }
 
 func (a6 A6Minas) ioStatusListener(masterDev MasterDevice) {
-
 	// Edge detectors — only act on rising edge to prevent storm on sustained signal.
 	// POT/NOT bounce at the limit: without edge detection, every poll cycle while
 	// the limit is active fires FastPowerOff+StopJog, flooding the system.
@@ -190,7 +169,7 @@ func (a6 A6Minas) ioStatusListener(masterDev MasterDevice) {
 			var ioStat statusnotifier.IOStatus
 
 			// All signals come from the PDO-fed 4F25 atomic — no SDO calls.
-			val := GetDigitalInputs4F25()
+			val      := GetDigitalInputs4F25()
 			toBinary := helper.IntToBinary(int(val))
 
 			// ECS (bit 0, active high)
@@ -212,7 +191,7 @@ func (a6 A6Minas) ioStatusListener(masterDev MasterDevice) {
 			ioStat.DCL   = a6.isIOOn(toBinary, 7, '1')
 			ioStat.ALMIN = a6.isIOOn(toBinary, 4, '0')
 
-			driverState := getCurrentDriverStatus(masterDev.Name)
+			driverState  := getCurrentDriverStatus(masterDev.Name)
 			ioStat.FIN   = driverState.isSendingFinSignal
 			ioStat.SOLOP = driverState.isDriverOnOff
 			// Drive fault state from stw bit3 — drives the FAULT LED in the UI
@@ -257,14 +236,8 @@ func (a6 A6Minas) isIOOn(binary string, binpos int, isVal rune) bool {
 	if len(binary) <= 0 {
 		return false
 	}
-
 	if binary[binpos] == byte(isVal) {
 		return true
 	}
 	return false
-	// str := strings.Split(binary, "")
-	// if str[binpos] == isVal {
-	// 	return true
-	// }
-	// return false
 }
