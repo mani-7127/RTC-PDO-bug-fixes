@@ -22,9 +22,6 @@ const (
 	baudRate     = 9600
 )
 
-// getFilesPath returns the correct FILES path regardless of run location.
-// Using helper.GetCodeFilePath() avoids the hardcoded /mnt/app/jamun path
-// that broke execution when running from the dev directory.
 func getFilesPath() string {
 	return helper.GetCodeFilePath() + "/FILES"
 }
@@ -33,9 +30,23 @@ var executionInProgress atomic.Bool
 var fileUpdatedDuringExecution atomic.Bool
 
 // pendingCommand holds the last RS232 command received while execution was
-// in progress. Only the most recent command matters — older ones are
-// superseded. This prevents a queue of stale commands building up.
+// in progress. Only the most recent command matters — older ones are superseded.
 var pendingCommand atomic.Value // stores string
+
+// lastReceivedCmd and lastReceivedAt are used to debounce the RS232 input.
+// The CNC machine often sends the same command string multiple times in rapid
+// succession (retransmit / polling behaviour). We drop duplicates received
+// within debounceWindow to avoid flooding the executor with redundant interrupts.
+var lastReceivedCmd atomic.Value  // stores string
+var lastReceivedAt  atomic.Int64  // stores UnixNano
+
+const debounceWindow = 200 * time.Millisecond
+
+// waitForProgramFileUpdateTimeout is the maximum time to wait for the CNC to
+// send the next command after a motion completes. If the machine goes silent
+// (cable fault, program end, operator stop), the executor unblocks and exits
+// cleanly rather than hanging forever.
+const waitForProgramFileUpdateTimeout = 60 * time.Second
 
 func StartSerialListener() {
 	cfg := &serial.Config{Name: serialDevice, Baud: baudRate, ReadTimeout: time.Millisecond * 200}
@@ -80,12 +91,26 @@ func handleRS232Command(cmd string) {
 		return
 	}
 
+	// Debounce: drop identical commands arriving within debounceWindow.
+	// The CNC often retransmits the same string several times in <10ms.
+	// Without this, each copy sends a stop_prog_exec, thrashes FILES, and
+	// interrupts the executor unnecessarily.
+	now := time.Now().UnixNano()
+	prev, _ := lastReceivedCmd.Load().(string)
+	prevAt := time.Duration(lastReceivedAt.Load())
+	if cmd == prev && time.Duration(now)-prevAt < debounceWindow {
+		logger.Debug("[RS232] Debounced duplicate command:", cmd)
+		return
+	}
+	lastReceivedCmd.Store(cmd)
+	lastReceivedAt.Store(now)
+
 	parts := parseBatchCommands(cmd)
 	logger.Info("[RS232] Batch received:", cmd)
 	logger.Info("[RS232] Parsed commands:", strings.Join(parts, " | "))
 
 	// Validate every token BEFORE writing anything to FILES.
-	// If any token is invalid, reject the entire batch and log it.
+	// If any token is invalid, reject the entire batch.
 	normalized := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
@@ -106,7 +131,6 @@ func handleRS232Command(cmd string) {
 	}
 
 	// All tokens valid — rebuild FILES atomically from the full batch.
-	// rebuildFILES enforces strict line ordering and G68 rules.
 	if err := rebuildFILES(normalized); err != nil {
 		logger.Error("[RS232] rebuildFILES failed, falling back to token update:", err)
 		for _, norm := range normalized {
@@ -121,11 +145,8 @@ func handleRS232Command(cmd string) {
 	}
 
 	if executionInProgress.Load() {
-		// Interrupt the currently running executor immediately so it exits
-		// RunCodeFile and returns. The deferred command will then execute
-		// cleanly in the re-launch of executeFilesProgramOnce.
-		// Without this, the old execution stays blocked in doECSCheck or
-		// waitForProgramFileUpdate indefinitely.
+		// Interrupt the currently running executor so it exits RunCodeFile.
+		// The deferred command will then execute cleanly on re-launch.
 		channels.WriteCommandExecInput("stop_prog_exec", "")
 		fileUpdatedDuringExecution.Store(true)
 		pendingCommand.Store(cmd)
@@ -141,21 +162,24 @@ func handleRS232Command(cmd string) {
 // FILES REBUILD
 // Constructs FILES from scratch with strict line ordering:
 //
-//   G01 F<n>;     — feedrate (always first)
-//   G90; / G91;   — absolute / incremental mode
-//   [G68;]        — shortest path (G90 only, omitted in G91)
-//   A<deg>;       — target axis position
-//   M99;          — loop back
+//   G01 F<n>;   — feedrate (always first)
+//   G90; / G91; — absolute / incremental mode
+//   [G68;]      — shortest path (G90 only, omitted in G91)
+//   A<deg>;     — target axis position
+//   M99;        — loop back
 //
-// G68 rules:
-//   G91 sent       → G68 removed (not valid in incremental mode)
-//   G90 + G68 sent → G68 added after G90 line
-//   G90 no G68     → G68 omitted
+// G68 persistence rules:
+//   - If the incoming batch contains G68 explicitly  → include G68
+//   - If the incoming batch contains G69 explicitly  → omit G68
+//   - If neither G68 nor G69 in the batch           → preserve
+//     whatever G68 state is in the existing FILES
+//   - G68 is always removed when mode is G91
 // ------------------------------------------------------------
 
 func rebuildFILES(normalized []string) error {
 	var feedrate, modeCmd, axisCmd string
-	var hasG68 bool
+	g68Explicit := false
+	g69Explicit := false
 
 	for _, tok := range normalized {
 		u := upperTrim(tok)
@@ -167,9 +191,9 @@ func rebuildFILES(normalized []string) error {
 		case u == "G91":
 			modeCmd = "G91;"
 		case u == "G68":
-			hasG68 = true
+			g68Explicit = true
 		case u == "G69":
-			hasG68 = false
+			g69Explicit = true
 			if modeCmd == "" {
 				modeCmd = "G90;"
 			}
@@ -179,7 +203,7 @@ func rebuildFILES(normalized []string) error {
 	}
 
 	// Fall back to existing FILES content for any field not supplied.
-	existingFeedrate, existingAxis, existingMode := readExistingFILES()
+	existingFeedrate, existingAxis, existingMode, existingHasG68 := readExistingFILES()
 	if feedrate == "" {
 		feedrate = firstNonEmpty(existingFeedrate, "G01 F20;")
 	}
@@ -188,6 +212,20 @@ func rebuildFILES(normalized []string) error {
 	}
 	if modeCmd == "" {
 		modeCmd = firstNonEmpty(existingMode, "G90;")
+	}
+
+	// Determine final G68 state:
+	//   explicit G68 in batch → true
+	//   explicit G69 in batch → false
+	//   neither               → inherit from existing FILES
+	var hasG68 bool
+	switch {
+	case g68Explicit:
+		hasG68 = true
+	case g69Explicit:
+		hasG68 = false
+	default:
+		hasG68 = existingHasG68
 	}
 
 	lines := []string{feedrate, modeCmd}
@@ -213,7 +251,10 @@ func rebuildFILES(normalized []string) error {
 	return writeFILESAtomic(lines)
 }
 
-func readExistingFILES() (feedrate, axis, mode string) {
+// readExistingFILES reads the current FILES content and returns its
+// feedrate, axis, mode, and G68 state for use as fallback values when
+// a new command does not supply those fields.
+func readExistingFILES() (feedrate, axis, mode string, hasG68 bool) {
 	content, err := os.ReadFile(getFilesPath())
 	if err != nil {
 		return
@@ -229,6 +270,10 @@ func readExistingFILES() (feedrate, axis, mode string) {
 			feedrate = lt
 		case u == "G90" || u == "G91":
 			mode = lt
+		case u == "G68":
+			hasG68 = true
+		case u == "G69":
+			hasG68 = false
 		case isAxisKey(u):
 			axis = lt
 		}
@@ -274,7 +319,11 @@ func writeFILESAtomic(lines []string) error {
 // ------------------------------------------------------------
 
 func executeFilesProgramOnce() {
-	defer executionInProgress.Store(false)
+	// NOTE: executionInProgress.Store(false) is NOT deferred here.
+	// It is called explicitly only at the non-re-execute exit path below.
+	// When a deferred re-execution is triggered, we return without clearing
+	// the flag so handleRS232Command cannot race in between the defer and
+	// the new goroutine launch, which was causing concurrent executor runs.
 
 	logger.Info("[RS232] Preparing program execution")
 
@@ -283,7 +332,12 @@ func executeFilesProgramOnce() {
 	time.Sleep(200 * time.Millisecond)
 
 	motor.RefreshCurrentPosition()
-	time.Sleep(2 * time.Second)
+
+	// Short settle wait — enough for the PDO cyclic to stabilise after reset.
+	// The previous 2s unconditional sleep added 2s of latency to every
+	// RS232-triggered re-execution. 400ms is sufficient for the drive to
+	// reach a stable state when no physical motion was happening.
+	time.Sleep(400 * time.Millisecond)
 
 	file := getFilesPath()
 
@@ -313,9 +367,49 @@ func executeFilesProgramOnce() {
 		logger.Info("[RS232] Deferred update detected, re-executing latest program. Triggered by:", pending)
 		fileUpdatedDuringExecution.Store(false)
 		pendingCommand.Store("")
-		executionInProgress.Store(true)
+		// executionInProgress is already true — do NOT clear it before launching
+		// the next goroutine. This prevents handleRS232Command from racing in
+		// between and launching a competing goroutine.
 		go executeFilesProgramOnce()
+		return // exit without calling Store(false) — next goroutine owns the flag
 	}
+
+	// Normal exit: no pending re-execution. Release the lock.
+	executionInProgress.Store(false)
+}
+
+// WaitForProgramFileUpdate polls for the FILES mod time to change.
+// Returns true if a file update was detected, false if timeout elapsed.
+// This is called by command_executor.go via the RS232 blocking path.
+// A timeout prevents a permanent hang if the CNC goes silent.
+func WaitForProgramFileUpdate(filePath string) bool {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		logger.Warn("[RS232] Could not stat file for updates:", err)
+		return false
+	}
+
+	lastMod := info.ModTime()
+	deadline := time.Now().Add(waitForProgramFileUpdateTimeout)
+
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+
+		info, err := os.Stat(filePath)
+		if err != nil {
+			logger.Warn("[RS232] Could not stat file for updates:", err)
+			return false
+		}
+
+		if info.ModTime().After(lastMod) {
+			logger.Info("[RS232] Detected program file update:", filePath)
+			return true
+		}
+	}
+
+	logger.Warn("[RS232] waitForProgramFileUpdate: timed out after", waitForProgramFileUpdateTimeout,
+		"— no new command received. Exiting RS232 wait loop.")
+	return false
 }
 
 // ------------------------------------------------------------
@@ -478,6 +572,7 @@ func normalizeControllerToken(s string) string {
 	s = strings.ReplaceAll(s, ",", " ")
 	s = strings.ToUpper(s)
 
+	// Fix GO1 -> G01 (letter O instead of zero, common typo)
 	if strings.HasPrefix(s, "GO") && len(s) >= 3 {
 		s = "G0" + s[2:]
 	}
@@ -548,7 +643,7 @@ func findInsertBeforeEnd(lines []string) int {
 }
 
 // updateFILESFromRS232 is the fallback token-by-token updater used when
-// rebuildFILES fails. Kept for safety — should rarely be reached.
+// rebuildFILES fails. Should rarely be reached.
 func updateFILESFromRS232(oneCmd string) error {
 	oneCmd = strings.TrimSpace(oneCmd)
 	if oneCmd == "" {

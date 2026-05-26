@@ -110,15 +110,26 @@ func InitMaster() error {
 			time.Sleep(300 * time.Millisecond)
 		}
 
-		// Keep existing boot flow intact.
-		// This now applies correction only for a genuine full power-cycle sign flip.
+		// Detect and correct encoder sign flip from full power cycle.
 		InitAposCorrection(dev.Name)
 
 		position++
 	}
 
+	// initListeners initializes driverStatusMap (via initDriverStatusKeeperListener).
+	// refreshCurrentPositionForDevice must come AFTER this — it calls
+	// getCurrentDriverStatus which reads from driverStatusMap and panics if nil.
 	initListeners(masterDevices)
 	setupDrivers(masterDevices)
+
+	// Seed position cache for all devices now that driverStatusMap is ready.
+	// This ensures the first move command or zero-ref sees the real live
+	// encoder position rather than the default 0.
+	for _, md := range masterDevices {
+		refreshCurrentPositionForDevice(md)
+		logger.Info("Boot position seeded for", md.Name,
+			"pos=", ReadActualPositionFromDrive(md), "°")
+	}
 
 	time.Sleep(500 * time.Millisecond)
 	if len(masterDevices) > 0 {
