@@ -73,7 +73,6 @@ func (e *ExecutionContext) Reset() {
 	e.LinearInterpolationEnabled = false
 	e.NextCmdLineToExec = 0
 	e.Err = nil
-	e.StopExecution = false
 	e.Divide360On = 0
 	e.LoopCount = 0
 	e.CurrentLoopCounter = 0

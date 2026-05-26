@@ -44,6 +44,7 @@ func listenCommandExecInput(execContext *dt.ExecutionContext) {
 			case "reset":
 				execContextToModify.HasResetted = true
 				execContextToModify.Reset()
+				execContextToModify.StopExecution = true
 				execContextToModify.NextLineWhenStopped = 0
 				execContextToModify.NextCmdLineToExec = 0
 				clearPersistedResumeState()

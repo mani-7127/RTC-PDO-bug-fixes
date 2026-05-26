@@ -17,7 +17,13 @@ func init() {
 
 func stopECSCheck() {
 	if isECSCheckInProgress {
-		stopECSCheckChan <- true
+		// Non-blocking send: if the motor goroutine is in the ECS debounce loop
+		// or has already returned naturally, it won't be reading the channel.
+		// A blocking send here deadlocks resetSystemWorker forever.
+		select {
+		case stopECSCheckChan <- true:
+		default:
+		}
 	}
 	isECSCheckInProgress = false
 }

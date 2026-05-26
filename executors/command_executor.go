@@ -413,6 +413,10 @@ func executeCommands(commands []dt.Command, nextCommandIndex int) error {
 		return err
 	}
 
+	// True if the command completed its motion naturally before any stop signal arrived.
+	// Used below to decide whether resume should replay the same line or advance past it.
+	commandCompletedNaturally := waitForNextBlock && !execContext.StopExecution
+
 	// RS232 file reload support
 	if IsRS232Enabled() && execContext.ExecutingFilePath != "" {
 		updatedCommands, err := createCommands(execContext.ExecutingFilePath)
@@ -457,7 +461,11 @@ func executeCommands(commands []dt.Command, nextCommandIndex int) error {
 	if execContext.StopExecution {
 		if execContext.HasResetted {
 			execContext.NextLineWhenStopped = 0
+		} else if commandCompletedNaturally {
+			// Motion finished before stop arrived — resume from the next line.
+			execContext.NextLineWhenStopped = nextCommandIndex + 1
 		} else {
+			// Stop interrupted mid-command — replay the same line on resume.
 			execContext.NextLineWhenStopped = nextCommandIndex
 		}
 
