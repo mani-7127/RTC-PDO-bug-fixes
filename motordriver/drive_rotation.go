@@ -43,14 +43,20 @@ func nonReverseDir(masterDevice MasterDevice) error {
 func ManualJog(masterDevice MasterDevice, direction int) error {
 	driverStatus := getCurrentDriverStatus(masterDevice.Device.Name)
 	if driverStatus.potNotExceeded {
-		// POT (positive/CW limit) hit — block CW jog only, allow CCW escape
-		if driverStatus.potExceeded && direction == 1 {
-			logger.Error("POT limit active, cannot jog CW (into limit). Jog CCW to escape.")
+		// When signFlipActive, command direction is inverted in position space.
+		// Use effectiveDirection for limit gating so escape works correctly.
+		effectiveDirection := direction
+		if signFlipActive.Load() {
+			effectiveDirection = -effectiveDirection
+		}
+		// POT (CW limit in position space) — block if moving toward POT
+		if driverStatus.potExceeded && effectiveDirection == 1 {
+			logger.Error("POT limit active, cannot jog toward POT. Jog away to escape.")
 			return errors.New("pot/not exceeded, exiting from jog")
 		}
-		// NOT (negative/CCW limit) hit — block CCW jog only, allow CW escape
-		if driverStatus.notExceeded && direction == -1 {
-			logger.Error("NOT limit active, cannot jog CCW (into limit). Jog CW to escape.")
+		// NOT (CCW limit in position space) — block if moving toward NOT
+		if driverStatus.notExceeded && effectiveDirection == -1 {
+			logger.Error("NOT limit active, cannot jog toward NOT. Jog away to escape.")
 			return errors.New("pot/not exceeded, exiting from jog")
 		}
 	}

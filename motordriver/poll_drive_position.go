@@ -122,13 +122,7 @@ func checkPotNotLimit(
 		return false
 	}
 
-	// FIX: removed re-alarm block — was re-firing POT/NOT alarm every 50ms
-	// while motor was stopped at limit, causing alarm flood on UI.
-	// The alarm is sent once when the limit is first detected below.
-
 	// Only check limits while motor is moving.
-	// This prevents false triggers when motor is stationary at or near
-	// the limit position (e.g. after escape jog stops just inside zone).
 	if !driverStatus.isMotorRunning {
 		return false
 	}
@@ -140,9 +134,20 @@ func checkPotNotLimit(
 	not := float64(driverSettings.NOT)
 	not = 360 + not
 
-	// POT (positive/CW limit): only trigger when moving CW (direction == 1).
-	// When direction == -1 (CCW/escape), motor is moving away — do not fire.
-	if driverStatus.direction == 1 && pot > 0 {
+	// When signFlipActive=true, getRawApos() negates the raw encoder value.
+	// This means the commanded direction and the position-space movement direction
+	// are INVERTED:
+	//   - command direction=+1 (CW)  → position decreases → moves toward NOT
+	//   - command direction=-1 (CCW) → position increases → moves toward POT
+	// We must use the effective position-space direction for limit gating,
+	// not the raw command direction.
+	effectiveDirection := driverStatus.direction
+	if signFlipActive.Load() {
+		effectiveDirection = -effectiveDirection
+	}
+
+	// POT (positive/CW limit): only trigger when moving toward POT in position space.
+	if effectiveDirection == 1 && pot > 0 {
 		if currentPosition >= (pot-threshold) &&
 			currentPosition <= pot+(threshold*10) {
 
@@ -156,9 +161,8 @@ func checkPotNotLimit(
 		}
 	}
 
-	// NOT (negative/CCW limit): only trigger when moving CCW (direction == -1).
-	// When direction == 1 (CW/escape), motor is moving away — do not fire.
-	if driverStatus.direction == -1 && not > 0 {
+	// NOT (negative/CCW limit): only trigger when moving toward NOT in position space.
+	if effectiveDirection == -1 && not > 0 {
 		if currentPosition <= (not+threshold) &&
 			currentPosition >= not-(threshold*10) {
 
