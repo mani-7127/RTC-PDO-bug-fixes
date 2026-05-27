@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	cmap "github.com/orcaman/concurrent-map"
 )
@@ -27,6 +28,7 @@ type driverCurrentStatus struct {
 	backlashInSetting   float64
 	isSendingFinSignal  bool
 	isDriverOnOff       bool
+	isProgramMode       bool // true while a program is executing
 }
 
 func (d *driverCurrentStatus) reset() {
@@ -39,6 +41,10 @@ func (d *driverCurrentStatus) reset() {
 	d.backlash = 0
 	d.workOffset = 0
 	d.isMotorRunning = false
+	// FIX: clear limit flags on reset so old POT/NOT alarm doesn't stay latched
+	d.potNotExceeded = false
+	d.potExceeded = false
+	d.notExceeded = false
 }
 
 //EventType type of event which can be notified to driver status keeper
@@ -54,10 +60,14 @@ const (
 )
 
 var driveStatusUpdated chan bool
-var waitForDriveStatusUpdate bool
+
+// waitForDriveStatusUpdate is atomic to prevent a data race between
+// notifyDriverStatusWithWait (writer, motion goroutine) and
+// doneDriveStatusUpdate (reader, listenDriverStatus goroutine).
+var waitForDriveStatusUpdate atomic.Bool
 
 func doneDriveStatusUpdate() {
-	if waitForDriveStatusUpdate {
+	if waitForDriveStatusUpdate.Load() {
 		driveStatusUpdated <- true
 	}
 }
@@ -135,23 +145,23 @@ func notifyDriverStatus(event EventType, data string, device MasterDevice) {
 	if !isStatusListening {
 		return
 	}
-	waitForDriveStatusUpdate = false
+	waitForDriveStatusUpdate.Store(false)
 	driverStatus := channels.DriverStatus{DriveName: device.Name, Data: data, Event: string(event)}
 	channels.BroadCastDriveStatusChannel <- driverStatus
 }
 
-//notifyDriverStatusWithWait callers can call this function if they need to ensure the driver status is updated
-//before moving to the next step. For e.g. setting backlash, the caller should move forward only after successfully
-//set the backlash other wise the system behave incorrectly
+// notifyDriverStatusWithWait callers can call this function if they need to ensure the driver status is updated
+// before moving to the next step. For e.g. setting backlash, the caller should move forward only after successfully
+// set the backlash other wise the system behave incorrectly
 func notifyDriverStatusWithWait(event EventType, data string, device MasterDevice) {
 	if !isStatusListening {
 		return
 	}
-	waitForDriveStatusUpdate = true
+	waitForDriveStatusUpdate.Store(true)
 	driverStatus := channels.DriverStatus{DriveName: device.Name, Data: data, Event: string(event)}
 	channels.BroadCastDriveStatusChannel <- driverStatus
 	<-driveStatusUpdated
-	waitForDriveStatusUpdate = false
+	waitForDriveStatusUpdate.Store(false)
 }
 
 func listenDriverStatus() {

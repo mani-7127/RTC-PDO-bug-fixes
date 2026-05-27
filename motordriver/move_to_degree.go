@@ -7,18 +7,25 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 // ----------------------------------------------------------
-// Precision configuration — unchanged from original uploaded version.
+// Precision configuration
 // ----------------------------------------------------------
 const (
-	positionToleranceFastPath = 0.05
-	positionToleranceFinal    = 0.05
+	positionToleranceFastPath = 0.02 // degrees — skip motion if already within this
+	positionToleranceFinal    = 0.02 // degrees — finish-signal gate
 )
+
+// motionMu prevents two moveMotorToDegree goroutines from running concurrently.
+// Without this guard, two rapid MOVE_TO_POSITION messages can both pass the
+// ECS-HIGH poll, both complete their settle loops, and both call sendECSFinSignal
+// — causing a double finish-signal bug.
+var motionMu sync.Mutex
 
 func clearTargetReached(device MasterDevice) {
 	logger.Debug("Clearing 'target reached' status for device:", device.Name)
@@ -41,11 +48,24 @@ func sleepMs(ms int) {
 //   - refreshCurrentPositionForDevice uses getRawApos() for sign-correct sync.
 //   - Fast-path calls doECSCheckZero after FIN (bug fix: original skipped it).
 func moveMotorToDegree(device MasterDevice, degreeToRotate float64) error {
+	// Serialise concurrent motion commands — prevents double FIN signal.
+	motionMu.Lock()
+	defer motionMu.Unlock()
+
 	driverStatus := getCurrentDriverStatus(device.Device.Name)
 
 	if driverStatus.potNotExceeded {
-		logger.Error("pot/not exceeded, exiting from move command")
-		return errors.New("pot/not exceeded, exiting from move command")
+		// Allow moves that escape away from the limit.
+		// POT (CW limit): block only if destination is further CW (> current position).
+		// NOT (CCW limit): block only if destination is further CCW (< current position).
+		if driverStatus.potExceeded && degreeToRotate > driverStatus.currentPosition {
+			logger.Error("POT limit active, cannot move CW (into limit). Move CCW to escape.")
+			return errors.New("pot/not exceeded, exiting from move command")
+		}
+		if driverStatus.notExceeded && degreeToRotate < driverStatus.currentPosition {
+			logger.Error("NOT limit active, cannot move CCW (into limit). Move CW to escape.")
+			return errors.New("pot/not exceeded, exiting from move command")
+		}
 	}
 
 	uid := uuid.New()
@@ -201,9 +221,19 @@ func stepMode(masterDevice MasterDevice, valueInDegreeToAdd float64) error {
 
 	driverStatus := getCurrentDriverStatus(masterDevice.Device.Name)
 	if driverStatus.potNotExceeded {
-		logger.Error("pot/not exceeded, exiting from move command")
-		channels.StepModeComplete()
-		return errors.New("pot/not exceeded, exiting from move command")
+		// Allow escape moves away from the limit.
+		blocked := false
+		if driverStatus.potExceeded && valueInDegreeToAdd > 0 {
+			blocked = true
+		}
+		if driverStatus.notExceeded && valueInDegreeToAdd < 0 {
+			blocked = true
+		}
+		if blocked {
+			logger.Error("pot/not exceeded, exiting from move command")
+			channels.StepModeComplete()
+			return errors.New("pot/not exceeded, exiting from move command")
+		}
 	}
 
 	err := freeRotate(masterDevice, valueInDegreeToAdd)

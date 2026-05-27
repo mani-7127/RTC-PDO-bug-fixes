@@ -67,7 +67,9 @@ func pollDrivePositionProcess(device MasterDevice, stopChan chan bool) {
 			curPos, posWithErrCorrection :=
 				currentPosition(rawPosition, device.Device.DriveXRatio, device.Name)
 
-			go checkPotNotLimit(curPos, device, driverSettings, driveStatus)
+			// FIX: inline call (not goroutine) so it reads fresh driveStatus,
+			// and passes device instead of hardcoded masterDevices[0].
+			checkPotNotLimit(curPos, device, driverSettings, driveStatus)
 
 			pitchError := getPitchError(device.Name, driveStatus.destinationPosition)
 
@@ -114,17 +116,21 @@ func checkPotNotLimit(
 	driverStatus driverCurrentStatus,
 ) (exceeded bool) {
 
-	if driverSettings.NOT >= 0 || driverSettings.POT <= 0 {
+	// FIX: was OR (||) — skipped limit checks whenever either limit was zero.
+	// Corrected to AND (&&): only skip when BOTH limits are unset (0).
+	if driverSettings.NOT >= 0 && driverSettings.POT <= 0 {
 		return false
 	}
 
-	if driverStatus.potNotExceeded {
-		if driverStatus.potExceeded {
-			statusnotifier.Alarm("POT Limit Exceeded")
-		} else {
-			statusnotifier.Alarm("NOT Limit Exceeded")
-		}
-		return true
+	// FIX: removed re-alarm block — was re-firing POT/NOT alarm every 50ms
+	// while motor was stopped at limit, causing alarm flood on UI.
+	// The alarm is sent once when the limit is first detected below.
+
+	// Only check limits while motor is moving.
+	// This prevents false triggers when motor is stationary at or near
+	// the limit position (e.g. after escape jog stops just inside zone).
+	if !driverStatus.isMotorRunning {
+		return false
 	}
 
 	threshold := device.Device.PotNotThreshold
@@ -134,13 +140,15 @@ func checkPotNotLimit(
 	not := float64(driverSettings.NOT)
 	not = 360 + not
 
+	// POT (positive/CW limit): only trigger when moving CW (direction == 1).
+	// When direction == -1 (CCW/escape), motor is moving away — do not fire.
 	if driverStatus.direction == 1 && pot > 0 {
 		if currentPosition >= (pot-threshold) &&
 			currentPosition <= pot+(threshold*10) {
 
-			FastPowerOff(masterDevices[0])
-			StopJog(masterDevices[0])
-			logger.Trace("POT limit exceeded")
+			FastPowerOff(device)
+			StopJog(device)
+			logger.Error("POT limit exceeded at", currentPosition)
 			channels.WriteCommandExecInput("stop_prog_exec", "")
 			statusnotifier.Alarm("POT Limit Exceeded")
 			exceeded = true
@@ -148,13 +156,15 @@ func checkPotNotLimit(
 		}
 	}
 
+	// NOT (negative/CCW limit): only trigger when moving CCW (direction == -1).
+	// When direction == 1 (CW/escape), motor is moving away — do not fire.
 	if driverStatus.direction == -1 && not > 0 {
 		if currentPosition <= (not+threshold) &&
 			currentPosition >= not-(threshold*10) {
 
-			FastPowerOff(masterDevices[0])
-			StopJog(masterDevices[0])
-			logger.Trace("NOT limit exceeded")
+			FastPowerOff(device)
+			StopJog(device)
+			logger.Error("NOT limit exceeded at", currentPosition)
 			channels.WriteCommandExecInput("stop_prog_exec", "")
 			statusnotifier.Alarm("NOT Limit Exceeded")
 			notifyDriverStatus("pot_not_exceeded", "NOT", device)

@@ -4,28 +4,31 @@ import (
 	channels "EtherCAT/channels"
 	logger   "EtherCAT/logger"
 	"EtherCAT/settings"
+	"sync/atomic"
 	"time"
 )
 
 var stopECSCheckChan chan bool
-var isECSCheckInProgress bool
+
+// isECSCheckInProgress is atomic to prevent a data race between
+// stopECSCheck (writer, reset goroutine) and waitForECS/waitForECSZero
+// (writer+reader, motion goroutine).
+var isECSCheckInProgress atomic.Bool
 
 func init() {
-	isECSCheckInProgress = false
-	stopECSCheckChan = make(chan bool)
+	isECSCheckInProgress.Store(false)
+	// Buffered so stopECSCheck never blocks if receiver already exited.
+	stopECSCheckChan = make(chan bool, 1)
 }
 
 func stopECSCheck() {
-	if isECSCheckInProgress {
-		// Non-blocking send: if the motor goroutine is in the ECS debounce loop
-		// or has already returned naturally, it won't be reading the channel.
-		// A blocking send here deadlocks resetSystemWorker forever.
+	if isECSCheckInProgress.Load() {
 		select {
 		case stopECSCheckChan <- true:
 		default:
 		}
 	}
-	isECSCheckInProgress = false
+	isECSCheckInProgress.Store(false)
 }
 
 // -------------------------------------------------------------------
@@ -84,9 +87,9 @@ func waitForECS(masterDevice MasterDevice) (int, error) {
 		return 0, err
 	}
 	driver := GetMotorDriver()
-	isECSCheckInProgress = true
+	isECSCheckInProgress.Store(true)
 	ecsStat := driver.receivedECS(masterDevice, operation, stopECSCheckChan)
-	isECSCheckInProgress = false
+	isECSCheckInProgress.Store(false)
 	return ecsStat, nil
 }
 
@@ -112,8 +115,8 @@ func readECSInput(_ MasterDevice) int {
 // uploaded version.
 // -------------------------------------------------------------------
 func waitForECSZero(masterDevice MasterDevice) (int, error) {
-	isECSCheckInProgress = true
-	defer func() { isECSCheckInProgress = false }()
+	isECSCheckInProgress.Store(true)
+	defer func() { isECSCheckInProgress.Store(false) }()
 
 	logger.Info("Waiting indefinitely for ECS to go LOW...")
 

@@ -38,12 +38,21 @@ func nonReverseDir(masterDevice MasterDevice) error {
 
 // ManualJog starts jogging using PDO velocity mode (Profile Velocity, mode=3).
 // Direction param: 1 = clockwise, -1 = counter-clockwise.
-// pot/not exceeded guard is preserved from the original uploaded version.
+// pot/not exceeded guard: blocks motion INTO the limit, but allows escape
+// in the opposite (safe) direction so the operator can recover without a full reset.
 func ManualJog(masterDevice MasterDevice, direction int) error {
 	driverStatus := getCurrentDriverStatus(masterDevice.Device.Name)
 	if driverStatus.potNotExceeded {
-		logger.Error("pot/not exceeded, exiting from jog")
-		return errors.New("pot/not exceeded, exiting from jog")
+		// POT (positive/CW limit) hit — block CW jog only, allow CCW escape
+		if driverStatus.potExceeded && direction == 1 {
+			logger.Error("POT limit active, cannot jog CW (into limit). Jog CCW to escape.")
+			return errors.New("pot/not exceeded, exiting from jog")
+		}
+		// NOT (negative/CCW limit) hit — block CCW jog only, allow CW escape
+		if driverStatus.notExceeded && direction == -1 {
+			logger.Error("NOT limit active, cannot jog CCW (into limit). Jog CW to escape.")
+			return errors.New("pot/not exceeded, exiting from jog")
+		}
 	}
 	if (pdoFbStatus.Load() & 0x0008) != 0 {
 		logger.Error("ManualJog blocked — drive is faulted (stw bit3=1), reset first")
